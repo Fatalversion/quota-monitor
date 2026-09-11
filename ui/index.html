@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>quota-monitor</title>
+    <link rel="stylesheet" href="./panel.css" />
+  </head>
+  <body data-mode="rail">
+    <div class="card" id="card">
+      <!-- Collapsed vertical dock: badges, upright bars, bare numbers. -->
+      <div class="rail" id="rail"></div>
+
+      <!-- Collapsed horizontal dock, for a top or bottom screen edge. -->
+      <div class="dock" id="dock"></div>
+
+      <!-- Expanded readout. Shared by hover-expand and the tray popover. -->
+      <div class="panel" id="panel">
+        <!-- The panel's drag handle. `data-tauri-drag-region` is the standard
+             way to say "pressing here moves the window", and it is what this
+             row is; "deep" means a press on the title or the clock counts too.
+             The shell intercepts the press before Tauri's own script acts on
+             it, so that a press that goes nowhere can still pin - see the
+             dragging block in the script below. -->
+        <div class="panel-head" data-tauri-drag-region="deep">
+          <span class="panel-title">quota</span>
+          <span class="panel-pin">pinned &middot; esc</span>
+          <span class="panel-stamp" id="stamp"></span>
+        </div>
+        <!-- Sidecar warnings. The envelope carries them, and dropping them
+             hides exactly the "this number is not what it looks like" notes
+             they exist to deliver. -->
+        <div class="panel-warn" id="warnings" hidden></div>
+        <div class="groups" id="groups"></div>
+      </div>
+    </div>
+
+    <script type="module">
+      import {
+        renderPanel,
+        renderRail,
+        renderDock,
+      } from './panel.js';
+
+      /*
+       * Two hosts, one document.
+       *
+       * Under Tauri the window is borderless and always on top, so expanding
+       * means resizing the OS window: a 60px dock cannot paint outside itself.
+       * In a plain browser there is no window to resize, so every Tauri call
+       * sits behind a capability check and index.html stays openable for
+       * design work with no toolchain at all.
+       */
+      const tauri = window.__TAURI__ ?? null;
+      const invoke = tauri?.core?.invoke ?? null;
+
+      const body = document.body;
+      const railEl = document.getElementById('rail');
+      const dockEl = document.getElementById('dock');
+      const panelEl = document.getElementById('panel');
+      const groupsEl = document.getElementById('groups');
+      const warnEl = document.getElementById('warnings');
+      const stampEl = document.getElementById('stamp');
+
+      const params = new URLSearchParams(location.search);
+      /** The tray popover forces the panel open and never collapses. */
+      const forcedPanel = params.get('mode') === 'panel';
+      /** Which collapsed layout the dock edge implies: 'rail' or 'bar'. */
+      let collapsedMode = params.get('dock') === 'bar' ? 'bar' : 'rail';
+
+      /*
+       * Which screen edge we are flush against. The card squares off the two
+       * corners that touch it: a 16px radius sitting against the bezel reads
+       * as a rendering fault, not as a style.
+       */
+      const EDGES = ['left', 'right', 'top', 'bottom'];
+      function setEdge(edge) {
+        body.dataset.dock = EDGES.includes(edge) ? edge : 'right';
+      }
+      setEdge(params.get('edge'));
+
+      let results = [];
+      let warnings = [];
+      let expanded = forcedPanel;
+      let pinned = false;
+      let collapseTimer = null;
+      /** The press being tracked as a possible drag, or null. See below. */
+      let drag = null;
+      /*
+       * Provider ids the user unticked in the tray menu.
+       *
+       * PRESENTATION ONLY. These providers are still read, still counted and
+       * still in the JSON envelope - the widget just does not draw them. It is
+       * not `providers.<id>.enabled` from the config file, which stops the
+       * adapter reading at all. The shell keeps the two apart deliberately;
+       * see src-tauri/src/visibility.rs.
+       */
+      let hiddenProviders = new Set();
+      /**
+       * Set by the collapsing branch below, and left a no-op in panel mode
+       * where there is nothing to collapse. Hoisted out of that block so the
+       * shell resync can arm it.
+       */
+      let requestCollapseSoon = () => {};
+
+      /* ------------------------------------------------------- theming -- */
+
+      /*
+       * Inherit the Windows accent and transparency rather than inventing a
+       * palette. The system already knows what the user picked for the
+       * taskbar, and a widget that ignores it looks like a foreign object.
+       *
+       * DWM stores accent colours as ABGR, not ARGB. Rust does the decoding
+       * and hands us plain hex, because getting that byte order backwards is
+       * the classic way to ship a blue theme as orange.
+       */
+      async function applySystemTheme() {
+        if (!invoke) return;
+        try {
+          const theme = await invoke('system_theme');
+          if (!theme) return;
+
+          document.documentElement.dataset.theme = theme.dark ? 'dark' : 'light';
+
+          const root = document.documentElement.style;
+          if (theme.accent) root.setProperty('--accent', theme.accent);
+          if (theme.accentSoft) root.setProperty('--accent-soft', theme.accentSoft);
+          if (theme.base) root.setProperty('--card-solid', theme.base);
+          if (theme.surface) root.setProperty('--surface', theme.surface);
+          if (theme.track) root.setProperty('--track', theme.track);
+          if (theme.text) root.setProperty('--text', theme.text);
+          if (theme.textDim) root.setProperty('--text-dim', theme.textDim);
+
+          /*
+           * When the compositor is painting acrylic behind us, the card must
+           * stop painting its own opaque ground or the blur is invisible.
+           * Respecting EnableTransparency matters: a user who turned it off
+           * did so deliberately, often for battery or motion reasons.
+           */
+          body.dataset.acrylic = theme.transparency ? 'true' : 'false';
+        } catch {
+          /* No system theme available. The stylesheet defaults stand. */
+        }
+      }
+
+      /* ---------------------------------------------------- visibility -- */
+
+      /**
+       * Adopt a hidden set from the shell. True when it actually changed, so
+       * the caller can decide whether a repaint is owed.
+       */
+      function applyHidden(list) {
+        const next = new Set(Array.isArray(list) ? list.filter((id) => typeof id === 'string') : []);
+        if (next.size === hiddenProviders.size && [...next].every((id) => hiddenProviders.has(id))) {
+          return false;
+        }
+        hiddenProviders = next;
+        return true;
+      }
+
+      /* ---------------------------------------------------------- data -- */
+
+      function unwrap(payload) {
+        if (Array.isArray(payload)) return { results: payload, warnings: [] };
+        return {
+          results: Array.isArray(payload?.results) ? payload.results : [],
+          warnings: Array.isArray(payload?.warnings) ? payload.warnings : [],
+        };
+      }
+
+      async function load() {
+        try {
+          // Browser preview: prefer a locally generated fixture, fall back to
+          // the committed sanitised sample so a fresh clone renders too.
+          const payload = invoke
+            ? await invoke('read_quota')
+            : await fetch('./fixture.json')
+                .then((r) => (r.ok ? r.json() : Promise.reject(new Error('no local fixture'))))
+                .catch(() => fetch('./fixture.sample.json').then((r) => r.json()));
+          ({ results, warnings } = unwrap(payload));
+        } catch (err) {
+          results = [{ ok: false, id: 'quota-monitor', error: String(err) }];
+          warnings = [];
+        }
+        paint();
+      }
+
+      function paint() {
+        const now = new Date();
+
+        /*
+         * Filtered here rather than at the source: `results` stays exactly what
+         * the sidecar said, so unticking a provider costs nothing to undo and
+         * nothing is lost if the shell and the page ever disagree.
+         *
+         * The count that matters to the renderers is how many of THESE results
+         * are hidden, not the size of the saved set - that set can still name
+         * a provider which has since been uninstalled, and a stale id must not
+         * change what the panel says about the providers actually in front of
+         * it.
+         */
+        const shown = results.filter((r) => !hiddenProviders.has(r.id));
+        const hiddenHere = results.length - shown.length;
+
+        renderRail(railEl, shown, hiddenHere);
+        renderDock(dockEl, shown, hiddenHere);
+        renderPanel(groupsEl, shown, now, hiddenHere);
+
+        // Warnings are envelope-level text, not per-provider data - "2
+        // transcript records had no usage block" is a note about the read, and
+        // there is no honest way to attribute it to a row. Hiding a provider
+        // hides its row, not the read's warnings.
+        warnEl.replaceChildren();
+        if (warnings.length > 0) {
+          for (const w of warnings) {
+            const line = document.createElement('div');
+            line.textContent = w;
+            warnEl.append(line);
+          }
+          warnEl.hidden = false;
+        } else {
+          warnEl.hidden = true;
+        }
+
+        stampEl.textContent = now.toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+
+        // No footer. It carried an estimated spend figure and a provider
+        // count; the spend was not wanted and the count was not worth a rule
+        // and eight pixels of padding on its own. `totalCost` stays exported
+        // from panel.js - it is correct, it is tested, and the CLI still has a
+        // use for it - it simply has no place in this panel.
+
+        fitWindow();
+      }
+
+      /** Ask Rust to fit the window to the content; provider count varies. */
+      function fitWindow() {
+        if (!invoke || body.dataset.mode !== 'panel') return;
+        requestAnimationFrame(() => {
+          // `measuring` frees the panel from the card's fixed height and from
+          // its own scrolling, so it reports the size it WANTS. Without it the
+          // panel measures its own clipping and the window never grows.
+          panelEl.classList.add('measuring');
+          const rect = panelEl.getBoundingClientRect();
+          const width = Math.ceil(Math.max(rect.width, panelEl.scrollWidth));
+          const height = Math.ceil(Math.max(rect.height, panelEl.scrollHeight));
+          panelEl.classList.remove('measuring');
+          if (width > 0 && height > 0) {
+            invoke('set_panel_size', { width, height }).catch(() => {});
+          }
+        });
+      }
+
+      /* ---------------------------------------------------------- modes -- */
+
+      function setMode(next) {
+        if (forcedPanel) return;
+        if (expanded === next) return;
+        expanded = next;
+        body.dataset.mode = next ? 'panel' : collapsedMode;
+        if (invoke) invoke('set_expanded', { expanded: next }).catch(() => {});
+        if (next) fitWindow();
+      }
+
+      if (forcedPanel) {
+        body.dataset.mode = 'panel';
+      } else {
+        body.dataset.mode = collapsedMode;
+
+        /*
+         * Hover is a peek; a click is a commitment.
+         *
+         * Hover-only was the original design and it was unusable: the panel
+         * vanished the moment you moved toward it, so nothing in it could be
+         * read carefully or copied. A click now pins it until focus is lost
+         * or Escape is pressed. Collapse stays delayed because crossing the
+         * seam between dock and panel briefly leaves both.
+         */
+        const collapseSoon = () => {
+          if (collapseTimer) clearTimeout(collapseTimer);
+          collapseTimer = setTimeout(() => {
+            if (!pinned && !drag) setMode(false);
+          }, 350);
+        };
+        requestCollapseSoon = collapseSoon;
+
+        const pin = () => {
+          if (pinned) return;
+          pinned = true;
+          body.dataset.pinned = 'true';
+          if (collapseTimer) clearTimeout(collapseTimer);
+          setMode(true);
+          if (invoke) invoke('set_pinned', { pinned: true }).catch(() => {});
+        };
+
+        const unpin = () => {
+          if (!pinned) return;
+          pinned = false;
+          body.dataset.pinned = 'false';
+          if (invoke) invoke('set_pinned', { pinned: false }).catch(() => {});
+          setMode(false);
+        };
+
+        addEventListener('mouseenter', () => {
+          if (collapseTimer) clearTimeout(collapseTimer);
+          setMode(true);
+        });
+
+        addEventListener('mouseleave', () => {
+          // A drag drops the pointer out of the window whenever the window
+          // cannot keep up with it. Collapsing then would shrink the thing
+          // out from under the hand that is moving it.
+          if (!pinned && !drag) collapseSoon();
+        });
+
+        // Anywhere that is not a handle: press to pin, exactly as before.
+        // Presses on a handle are suppressed below and answered on release.
+        addEventListener('mousedown', () => {
+          if (!drag) pin();
+        });
+
+        // Clicking anywhere outside blurs the window; that is our "click out".
+        addEventListener('blur', unpin);
+        addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') unpin();
+        });
+
+        /* ------------------------------------------------------ dragging -- */
+
+        /*
+         * Drag to move, click to pin, and the rule that tells them apart.
+         *
+         * THE RULE: a press on a handle that travels less than DRAG_SLOP
+         * before the button comes up is a click, and pins. Anything further
+         * is a drag, moves the window, and does NOT pin. The threshold is
+         * what makes both possible from the same press - the alternative,
+         * deciding on the way down, means either the header cannot be
+         * dragged or it cannot be clicked. Four pixels is small enough that
+         * nobody clicking notices it and large enough to absorb the shake of
+         * a real hand on a real mouse.
+         *
+         * A drag deliberately leaves the panel unpinned. Pinning takes focus
+         * (see the note at the top of strip.rs), and moving a widget is not a
+         * request to be given the caret.
+         *
+         * Why not just let Tauri do it? The handles carry
+         * data-tauri-drag-region, but Tauri's own script would act on the
+         * mousedown and hand the press to the OS: that call is not in this
+         * app's capability list, the OS drag eats the mouseup so the click
+         * could never pin, and it reports no end, so there would be no moment
+         * at which to snap to an edge. So the press is intercepted here and
+         * the window is moved by the shell instead, a frame at a time.
+         *
+         * Offsets sent to Rust are always TOTAL travel since the press, never
+         * a step since the last frame: a frame that is dropped or coalesced
+         * then costs nothing, and rounding cannot accumulate into drift.
+         */
+        const DRAG_SLOP = 4;
+
+        let gestures = 0;
+        let sending = false;
+        let queued = null;
+
+        /** At most one drag_move in flight, and always the newest offset. */
+        const pump = () => {
+          if (!invoke || sending || queued === null) return;
+          const frame = queued;
+          queued = null;
+          sending = true;
+          invoke('drag_move', frame)
+            .catch(() => {})
+            .finally(() => {
+              sending = false;
+              pump();
+            });
+        };
+
+        const handleUnder = (node) =>
+          node instanceof Element ? node.closest('[data-tauri-drag-region]') : null;
+
+        const finish = (event, dx, dy) => {
+          const press = drag;
+          if (!press) return;
+          drag = null;
+          queued = null; // nothing stale may land after the snap
+          body.dataset.dragging = 'false';
+          try {
+            press.handle.releasePointerCapture(press.pointer);
+          } catch {
+            /* The capture may already be gone; that is what cancelled us. */
+          }
+
+          if (!press.moved) {
+            pin();
+            return;
+          }
+
+          if (invoke) {
+            invoke('drag_end', { gesture: press.id, dx, dy }).catch(() => {});
+          }
+
+          // The pointer can end up off the window when it out-ran it. The
+          // mouseleave that would normally collapse the panel was ignored
+          // while dragging, so nothing else is going to ask for it.
+          const outside =
+            event &&
+            (event.clientX < 0 ||
+              event.clientY < 0 ||
+              event.clientX > innerWidth ||
+              event.clientY > innerHeight);
+          if (outside) collapseSoon();
+        };
+
+        addEventListener(
+          'pointerdown',
+          (event) => {
+            if (event.button !== 0 || event.isPrimary === false) return;
+            const handle = handleUnder(event.target);
+            if (!handle) return;
+
+            gestures += 1;
+            drag = {
+              id: gestures,
+              pointer: event.pointerId,
+              x: event.screenX,
+              y: event.screenY,
+              dx: 0,
+              dy: 0,
+              moved: false,
+              handle,
+            };
+            // Keeps the events coming when the window falls behind the
+            // pointer, which is the difference between a drag that survives
+            // a fast flick across the screen and one that stops halfway.
+            try {
+              handle.setPointerCapture(event.pointerId);
+            } catch {
+              /* Older engines: the drag still works while inside the window. */
+            }
+            // Suppresses the compatibility mousedown, and with it both the
+            // text cursor and the pin-on-press above.
+            event.preventDefault();
+          },
+          true,
+        );
+
+        // Belt and braces for the line above: Tauri's drag-region script is a
+        // bubble-phase mousedown listener on `document`, so a capture-phase
+        // one on `window` is guaranteed to run first. If preventDefault on
+        // pointerdown ever fails to suppress the mousedown, this still does.
+        addEventListener(
+          'mousedown',
+          (event) => {
+            if (!drag) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          },
+          true,
+        );
+
+        addEventListener('pointermove', (event) => {
+          if (!drag || event.pointerId !== drag.pointer) return;
+          drag.dx = event.screenX - drag.x;
+          drag.dy = event.screenY - drag.y;
+
+          if (!drag.moved) {
+            if (Math.abs(drag.dx) < DRAG_SLOP && Math.abs(drag.dy) < DRAG_SLOP) return;
+            drag.moved = true;
+            body.dataset.dragging = 'true';
+            if (collapseTimer) clearTimeout(collapseTimer);
+          }
+
+          queued = { gesture: drag.id, dx: drag.dx, dy: drag.dy };
+          pump();
+        });
+
+        addEventListener('pointerup', (event) => {
+          if (!drag || event.pointerId !== drag.pointer) return;
+          finish(event, event.screenX - drag.x, event.screenY - drag.y);
+        });
+
+        // The system took the pointer away mid-drag. Leave the widget where
+        // it got to and snap it, rather than stranding it between edges.
+        addEventListener('pointercancel', (event) => {
+          if (!drag || event.pointerId !== drag.pointer) return;
+          finish(null, drag.dx, drag.dy);
+        });
+
+        /*
+         * The collapsed layout is no longer decided once at startup.
+         *
+         * `?dock=bar` is the shell's opening statement; a drop that lands on
+         * a different pair of edges changes the answer, and the shell says so
+         * with an event rather than making the page poll for something that
+         * changes only when the user drags the widget somewhere.
+         */
+        if (tauri?.event?.listen) {
+          tauri.event
+            .listen('widget-layout', (event) => {
+              // The edge changes on every snap; the layout only when the drop
+              // crosses between a vertical and a horizontal side. Take both.
+              setEdge(event?.payload?.dock);
+              const next = event?.payload?.layout;
+              if (next !== 'rail' && next !== 'bar') return;
+              collapsedMode = next;
+              if (!expanded) body.dataset.mode = collapsedMode;
+            })
+            .catch(() => {
+              /* No event bus: the layout stays whatever the URL asked for. */
+            });
+        }
+      }
+
+      /* --------------------------------------------------- shell events -- */
+
+      /*
+       * Both windows listen, because both can be open.
+       *
+       * Refresh is the tray menu asking for a read NOW rather than at the next
+       * tick of the 60-second timer. It used to reload the document, which
+       * threw away `expanded`, `pinned` and the collapsed layout while the
+       * shell went on believing the strip was still panel-sized - a wide squat
+       * window with a 72px rail drawn inside it. Re-running load() is what
+       * "refresh the data" actually means.
+       */
+      if (tauri?.event?.listen) {
+        tauri.event.listen('quota-refresh', () => {
+          load();
+        }).catch(() => {
+          /* No event bus: the 60-second poll is still running. */
+        });
+
+        // A provider was ticked or unticked in the tray menu. paint() ends in
+        // fitWindow(), so the strip resizes to the shorter content in the same
+        // breath rather than leaving a panel with a hole in it.
+        tauri.event.listen('provider-visibility', (event) => {
+          if (applyHidden(event?.payload?.hidden)) paint();
+        }).catch(() => {
+          /* No event bus: the next widget_state call catches up. */
+        });
+      }
+
+      /*
+       * Re-synchronise with the shell on every load.
+       *
+       * A page can load without anyone asking for it: a webview crash and
+       * restart, a navigation, a future refresh written by someone who has not
+       * read the note above. When that happens the JavaScript starts from its
+       * defaults - collapsed, unpinned, drawing the layout in the URL - while
+       * the shell's window is still whatever size the page had grown it to,
+       * and the two disagree until the user hovers.
+       *
+       * The fix is to ask rather than assume. The shell owns the window, so it
+       * is the side that knows: it answers with the docked edge, the collapsed
+       * shape, whether the strip is expanded, whether it is pinned, and which
+       * providers are hidden. Preferred over the other obvious fix - having
+       * the shell collapse the strip whenever its webview navigates - because
+       * this one restores the user's state instead of destroying it, needs no
+       * new window-event path to fight with the pin, and fixes the same
+       * staleness for the docked EDGE, which the URL only knows as of the
+       * moment the window was created and a drag has been able to invalidate
+       * ever since.
+       */
+      async function syncWithShell() {
+        if (!invoke) return;
+
+        let state;
+        try {
+          state = await invoke('widget_state');
+        } catch {
+          /* An older shell, or one that could not answer. The URL stands. */
+          return;
+        }
+        if (!state) return;
+
+        applyHidden(state.hidden);
+
+        // The popover is always a panel and is docked to nothing, so the rest
+        // of the answer is not about it.
+        if (forcedPanel) return;
+
+        if (state.dock) setEdge(state.dock);
+        if (state.layout === 'rail' || state.layout === 'bar') collapsedMode = state.layout;
+
+        pinned = state.pinned === true;
+        body.dataset.pinned = pinned ? 'true' : 'false';
+
+        expanded = state.expanded === true;
+        body.dataset.mode = expanded ? 'panel' : collapsedMode;
+
+        // Expanded but not pinned means the window is open because a pointer
+        // was over it, and nothing will ever ask for the collapse: the
+        // mouseleave that would have belongs to a document that no longer
+        // exists. Arm the same timer a mouseleave arms. A pointer that really
+        // is on the widget gets it back on the next crossing.
+        if (expanded && !pinned) requestCollapseSoon();
+
+        /*
+         * A pin is only a pin while the window can hear the blur that ends it.
+         * A document that came back without focus - the webview crashed while
+         * pinned, say - would otherwise hold the panel open with no way out:
+         * blur never fires and Escape needs the keyboard. So the pin is
+         * checked once the activation has had a moment to settle, and dropped
+         * if it turns out to be unenforceable.
+         */
+        if (pinned) {
+          setTimeout(() => {
+            if (!pinned || document.hasFocus()) return;
+            pinned = false;
+            body.dataset.pinned = 'false';
+            invoke('set_pinned', { pinned: false }).catch(() => {});
+            requestCollapseSoon();
+          }, 400);
+        }
+      }
+
+      applySystemTheme();
+      // Sequenced, not raced: knowing what to leave out before the first paint
+      // is the difference between a clean start and drawing a hidden provider
+      // and snatching it back. Both paths end in load() - a shell that cannot
+      // answer must not cost us the data.
+      syncWithShell().then(load, load);
+      setInterval(load, 60_000);
+      // The user can switch light/dark or repaint their accent at any time.
+      setInterval(applySystemTheme, 30_000);
+    </script>
+  </body>
+</html>

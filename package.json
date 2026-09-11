@@ -1,0 +1,40 @@
+{
+  "name": "quota-monitor",
+  "version": "0.0.1",
+  "description": "One widget for every AI subscription you are burning through.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "quota": "./dist/cli/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "build:installer": "node scripts/widget.mjs build",
+    "dev": "tsx src/cli/index.ts",
+    "dev:widget": "node scripts/widget.mjs dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "ui:fixture": "node scripts/write-fixture.mjs",
+    "ui:serve": "node scripts/serve-ui.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

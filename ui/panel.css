@@ -1,0 +1,712 @@
+/*
+ * quota-monitor widget styling.
+ *
+ * Follows the supplied design: a warm charcoal card with generous corners, a
+ * provider icon badge per group, and bars carrying the colour rather than the
+ * text. Three layouts share one DOM, switched by body[data-mode]:
+ *
+ *   panel   the expanded readout, grouped by provider
+ *   rail    the collapsed vertical dock (icons, upright bars, bare numbers)
+ *   bar     the collapsed horizontal dock (icon, bar, percentage, repeated)
+ *
+ * This design is dark-first, so the tokens below ARE the dark palette and the
+ * light block inverts them. That is the opposite of the usual order and it is
+ * deliberate: the widget floats over whatever is behind it, and the charcoal
+ * card is the identity.
+ */
+
+:root {
+  --card: #38363300;
+  --card-solid: #383633;
+  --surface: #2c2a28;
+  --track: #2b2926;
+  --badge-dim: #ece8e1;
+
+  --text: #f2efea;
+  --text-dim: #8d8880;
+  --text-faint: #6d6862;
+
+  /* One accent does the work. Orange is the brand note in the mockups, and
+     escalation is carried by the bar filling up, not by a colour change. */
+  --accent: #e8763c;
+  --accent-soft: #f0954a;
+  --stale: #e8934a;
+  --crit: #e2604a;
+
+  --radius-card: 16px;
+  --radius-bar: 999px;
+  --radius-badge: 7px;
+
+  /* Thicker than the 2px hairline it started as: at 2px the fill was hard to
+     judge at a glance, which is the one thing the bar is for. Still a
+     measurement rather than a component, so no taller than the text beside it. */
+  --bar-h: 4px;
+  --badge: 22px;
+
+  --font: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --font-ui: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* The card is a fixed identity, but a viewer on a light desktop still gets a
+   lighter surround so it does not read as a hole punched in the screen. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --card-solid: #3d3b38;
+    --surface: #322f2c;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  /* Chrome, not content: dragging across the dock must not start a selection. */
+  user-select: none;
+  cursor: default;
+}
+
+/*
+ * The two drag handles: the panel's header and the rail's badge row.
+ *
+ * A widget you cannot move is a widget in the wrong place, so the handles have
+ * to look like handles. `grab` is the only affordance available - there is no
+ * title bar to grip and no room for a dotted gutter at these sizes - and it is
+ * the one users already know from every other floating panel.
+ *
+ * `user-select: none` matters as much as the cursor: the panel sets
+ * `user-select: text` so a figure can be copied, and without this a drag along
+ * the header would paint a selection across "quota" as it went.
+ */
+[data-tauri-drag-region] {
+  cursor: grab;
+  user-select: none;
+}
+
+body[data-dragging="true"],
+body[data-dragging="true"] [data-tauri-drag-region] {
+  cursor: grabbing;
+}
+
+/* ------------------------------------------------------------- shared -- */
+
+/*
+ * The card MUST be a definite height, not auto.
+ *
+ * Everything inside sizes with `height: 100%` or `flex: 1`, and a percentage
+ * height against an auto-height parent resolves to nothing. The first build
+ * omitted this and the result was a widget with no bars at all: the rail's
+ * upright bars collapsed to zero pixels, and the panel could not measure
+ * itself so it grew a scrollbar instead of sizing the window.
+ */
+.card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--card-solid);
+  border-radius: var(--radius-card);
+  /*
+   * NO OUTER DROP SHADOW. This is not a style preference, it is a constraint.
+   *
+   * A box-shadow paints OUTSIDE the border box, and the window is sized to the
+   * card exactly, so the shadow had nowhere to go but the transparent corner
+   * regions the rounding creates - and it was then clipped square at the window
+   * bounds. The result was a dark square ghost behind a rounded card, which is
+   * precisely what it looked like.
+   *
+   * The OS shadow is already off (`.shadow(false)` on both windows in Rust), so
+   * an inset hairline is all the depth available. It is enough: the card is a
+   * light form on a darker desktop and does not need lifting.
+   */
+  box-shadow: 0 1px 0 rgb(255 255 255 / 5%) inset;
+}
+
+/*
+ * Square off whichever corners touch the screen.
+ *
+ * The card is docked flush against a bezel, and a 16px radius sitting on that
+ * edge reads as a rendering fault rather than as a style - there is nothing
+ * behind it for the curve to reveal. Only the two corners on the free side
+ * stay round, which is also what makes the widget look attached to the edge
+ * rather than floating near it.
+ */
+body[data-dock="right"] .card {
+  border-start-end-radius: 0;
+  border-end-end-radius: 0;
+}
+
+body[data-dock="left"] .card {
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
+}
+
+body[data-dock="top"] .card {
+  border-start-start-radius: 0;
+  border-start-end-radius: 0;
+}
+
+body[data-dock="bottom"] .card {
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+}
+
+/*
+ * Acrylic is painted by the Windows compositor BEHIND the webview, so it is
+ * only visible if we stop painting over it. A tint is still needed: raw
+ * acrylic over a bright desktop washes the text out completely.
+ *
+ * Set only when the user has transparency enabled in Windows settings. Someone
+ * who turned it off did so on purpose, often for battery or motion sensitivity,
+ * and overriding that would be rude.
+ */
+body[data-acrylic="true"] .card {
+  background: color-mix(in srgb, var(--card-solid) 62%, transparent);
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 8%) inset;
+}
+
+/*
+ * Provider mark. The glyph is set as text so there is no image to load, no
+ * icon font, and nothing to go stale if a vendor changes its logo -- which
+ * also keeps us clear of shipping someone else's trademark as an asset.
+ */
+.badge {
+  width: var(--badge);
+  height: var(--badge);
+  flex: 0 0 auto;
+  border-radius: var(--radius-badge);
+  display: grid;
+  place-items: center;
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: #ffffff;
+  background: var(--accent);
+}
+
+.badge > svg {
+  width: 68%;
+  height: 68%;
+  display: block;
+}
+
+.badge[data-provider="codex"] {
+  background: var(--badge-dim);
+  color: #23211f;
+  font-size: 10px;
+}
+
+.badge[data-provider="codex"] > svg {
+  width: 76%;
+  height: 76%;
+}
+
+.badge[data-provider="unknown"] {
+  background: var(--surface);
+  color: var(--text-dim);
+}
+
+/* A bar is a bar in every mode; only the axis changes. */
+.bar {
+  background: var(--track);
+  border-radius: var(--radius-bar);
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  background: var(--tone, var(--accent));
+  border-radius: inherit;
+  transition:
+    width 260ms ease-out,
+    height 260ms ease-out;
+}
+
+/*
+ * No cap known, so no fill is honest. A faint groove says "we are not
+ * measuring this" where an empty bar would say "you have used none of it".
+ */
+.bar[data-status="unknown"] {
+  background: repeating-linear-gradient(
+    var(--groove-angle, 90deg),
+    var(--track) 0 3px,
+    transparent 3px 7px
+  );
+}
+
+/* -------------------------------------------------------------- panel -- */
+
+.panel {
+  display: none;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 16px 18px;
+  gap: 14px;
+  /* The panel is content: pinning exists so a figure can be read and copied. */
+  user-select: text;
+  cursor: auto;
+}
+
+body[data-mode="panel"] .panel {
+  display: flex;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.panel-pin,
+.panel-stamp {
+  font-family: var(--font);
+  font-size: 9.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-pin {
+  display: none;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+body[data-pinned="true"] .panel-pin {
+  display: inline;
+}
+
+body[data-pinned="true"] .card {
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 12%) inset;
+}
+
+.panel-warn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-inline-start: 8px;
+  border-inline-start: 2px solid var(--stale);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.panel-warn[hidden] {
+  display: none;
+}
+
+/*
+ * MEASUREMENT MODE.
+ *
+ * The panel must report the size it WANTS, and by default it cannot: it is a
+ * flex child of a fixed-height card, and `.groups` scrolls. Measured as-is it
+ * reports the size it already HAS, so the window never grows and the content
+ * scrolls inside it forever. That is precisely the bug that shipped: a 320x196
+ * window with a scrollbar and clipped text.
+ *
+ * For the duration of one measurement we free it: intrinsic width, auto
+ * height, no scrolling. index.html adds and removes this class inside a single
+ * animation frame, so this state is never painted.
+ */
+.panel.measuring {
+  width: max-content;
+  height: auto;
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+.panel.measuring .groups {
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+/*
+ * Prose does not wrap at max-content, so one long adapter error would
+ * otherwise decide the width of the whole window. Bounded only while
+ * measuring; normal rendering still spans the panel.
+ */
+.panel.measuring .panel-warn,
+.panel.measuring .row-error,
+.panel.measuring .empty {
+  max-width: 280px;
+}
+
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--track) transparent;
+}
+
+.groups::-webkit-scrollbar {
+  width: 5px;
+}
+
+.groups::-webkit-scrollbar-thumb {
+  background: var(--track);
+  border-radius: 3px;
+}
+
+/*
+ * One provider. The badge sits in its own column and the readings indent
+ * beside it, so two providers read as two blocks rather than four loose rows.
+ */
+.group {
+  display: grid;
+  grid-template-columns: var(--badge) 1fr;
+  gap: 0 12px;
+  align-items: start;
+}
+
+.group-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/*
+ * Provider on the left, plan on the right, sitting on the badge's baseline.
+ *
+ * The plan is the quieter of the two deliberately. It answers a question the
+ * reader only asks once - which ceiling are these percentages measured
+ * against - whereas the provider name is what they scan for.
+ */
+/*
+ * The header row is exactly one badge tall, with its text centred inside.
+ *
+ * That is what lines the logo up. The badge is 22px and a line of 11.5px text
+ * is about 14px, and both were aligned to the TOP of the group, so the badge
+ * hung 4px below the text it labels. Nudging it with a margin would fix this
+ * screen and break on the next font-size change; giving the row the badge's own
+ * height means the two are centred on the same axis by construction.
+ */
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: var(--badge);
+  margin-bottom: 2px;
+}
+
+.group-name {
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.group-plan {
+  font-family: var(--font);
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/*
+ * `max-content 1fr max-content`: label, clock, percentage.
+ *
+ * Never `1fr auto` for the first two - that gave the meta whatever it needed
+ * and the label whatever survived, which is how "Session" became "Ses...".
+ * The label is the shorter and more important string, so it gets exactly its
+ * width and the clock absorbs the slack.
+ *
+ * The percentage is its own column so the figures line up down the panel.
+ * Tacked onto the end of the clock they sat at a different x on every row and
+ * could not be compared at a glance, which is the whole job of the panel.
+ */
+.reading {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content;
+  gap: 7px 10px;
+  align-items: baseline;
+}
+
+.reading-pct {
+  font-family: var(--font);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  white-space: nowrap;
+  /* Reserve the width of "100%" so a row does not shuffle sideways when a
+     quota crosses from two digits to three. */
+  min-width: 4ch;
+  text-align: right;
+}
+
+/* The figure takes the bar's colour once it matters, so a row in trouble is
+   legible without reading the number. */
+.reading-pct[data-status="warn"] {
+  color: var(--accent-soft);
+}
+
+.reading-pct[data-status="crit"] {
+  color: var(--crit);
+}
+
+.reading-pct.is-none {
+  color: var(--text-faint);
+}
+
+.reading-name {
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.reading-meta {
+  font-family: var(--font);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A window that already rolled over. Its number describes the past, so it is
+   called out rather than quietly counted down to zero. */
+.reading-meta.is-stale {
+  color: var(--stale);
+}
+
+.reading .bar {
+  grid-column: 1 / -1;
+  height: var(--bar-h);
+  border-radius: 1px;
+  margin-top: 2px;
+}
+
+.reading .bar > i {
+  height: 100%;
+  width: var(--fill, 0%);
+}
+
+/*
+ * The honesty marker, carried over from the CLI. A derived percentage got its
+ * denominator from config, not from the provider. It is a hairline under the
+ * figure rather than a tilde, because the mockup has no room for punctuation
+ * and a silent estimate would be worse than an ugly one.
+ */
+.reading-meta .est {
+  border-bottom: 1px dotted var(--text-faint);
+}
+
+.row-error {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.row-error b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.panel-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font);
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.empty {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+/* --------------------------------------------------------------- rail -- */
+
+/*
+ * Collapsed vertical dock: badges across the top, upright bars filling from
+ * the bottom, bare numbers underneath. No percent signs and no labels -- at
+ * this size the badge says which provider and the number says how much.
+ */
+/*
+ * ONE GRID, not three stacked rows.
+ *
+ * The badge, the bar and the number for a provider were three separate flex
+ * rows, each with its own gap, so nothing lined up: a 22px badge, an 8px bar
+ * and a three-character number all centred themselves independently and drifted
+ * apart. A grid with one column per provider makes the column the shared
+ * vertical axis, which is the only way they stay aligned as the number changes
+ * width from "0%" to "100%".
+ *
+ * `grid-auto-flow: column` fills each column top to bottom before moving right,
+ * so the DOM order stays badge, bar, number, per provider.
+ */
+.rail {
+  display: none;
+  grid-template-rows: auto minmax(80px, 1fr) auto;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  justify-items: center;
+  align-items: center;
+  gap: 9px 6px;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 12px 8px;
+}
+
+body[data-mode="rail"] .rail {
+  display: grid;
+}
+
+/*
+ * The rail badge is smaller than the panel's.
+ *
+ * The arithmetic has to close or the row overflows: at 72px wide, less 8px of
+ * padding each side, two columns share 56px with a 6px gap, so each column is
+ * 25px. A 22px badge in a 20px column - which is what the old 64px rail gave -
+ * overflowed, and because a grid overflows to one side the content ended up
+ * 6.6px from the left edge and 2px from the right. It read as broken spacing
+ * on the left dock; it was really broken on both, just less visibly.
+ *
+ * 20px also leaves room for "100%" underneath, which is the widest string this
+ * column ever has to hold and the one that would otherwise resize the columns
+ * on the day a quota actually fills.
+ */
+.rail .badge {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+}
+
+.rail .bar {
+  width: 10px;
+  height: 100%;
+  min-height: 80px;
+  --groove-angle: 180deg;
+  align-self: stretch;
+  justify-self: center;
+}
+
+.rail .bar > i {
+  width: 100%;
+  height: var(--fill, 0%);
+  /* Upright bars fill from the bottom, so the fill has to sit at the bottom. */
+  margin-top: auto;
+}
+
+.rail-num {
+  font-family: var(--font);
+  /* Small enough that "100%" fits the column without the columns resizing as
+     the number changes. */
+  font-size: 9px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/*
+ * Nothing to draw. Either every provider is hidden, or none was detected.
+ *
+ * The card must not go blank: the collapsed widget is the only thing there is
+ * to hover, and hovering it is how the user reaches the panel that says what
+ * happened. One muted word, spanning the grid's three rows so it sits on the
+ * same axis a provider column would.
+ */
+.rail-none {
+  grid-row: 1 / -1;
+  font-family: var(--font);
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- bar -- */
+
+/*
+ * Collapsed horizontal dock, for a top or bottom screen edge. Same content as
+ * the rail, laid on its side, with the percent sign restored because there is
+ * room for it.
+ */
+.dock {
+  display: none;
+  align-items: center;
+  gap: 14px;
+  flex: 1 1 auto;
+  padding: 0 16px;
+}
+
+body[data-mode="bar"] .dock {
+  display: flex;
+}
+
+.dock-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.dock-item .bar {
+  width: 84px;
+  height: var(--bar-h);
+}
+
+.dock-item .bar > i {
+  height: 100%;
+  width: var(--fill, 0%);
+}
+
+.dock-pct {
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 30px;
+  text-align: right;
+}
+
+/* The bar's half of the note above. It has 300px to say it in. */
+.dock-none {
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar > i {
+    transition: none;
+  }
+}

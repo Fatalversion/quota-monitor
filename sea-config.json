@@ -1,0 +1,7 @@
+{
+  "main": "build/sea/quota.cjs",
+  "output": "build/sea/quota.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": true
+}

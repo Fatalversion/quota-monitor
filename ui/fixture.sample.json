@@ -1,0 +1,97 @@
+{
+  "tool": "quota-monitor",
+  "version": "0.0.1",
+  "generatedAt": "2026-09-11T13:44:00.000Z",
+  "warnings": [
+    "claude-code: 2 transcript records had no usage block and were skipped."
+  ],
+  "_comment": [
+    "Sanitised stand-in so ui/index.html opens in a plain browser with no",
+    "toolchain and no real account data. Regenerate a live one with",
+    "`npm run ui:fixture`, which writes ui/fixture.json (gitignored).",
+    "",
+    "This deliberately covers every awkward case the panel must survive:",
+    "a reading with limit null (no honest denominator, so no bar fill and no",
+    "percentage, just the raw amount), a DERIVED percentage that must carry",
+    "the tilde marker because its cap came from config rather than the",
+    "provider, a provider-reported percentage that must NOT carry it, a",
+    "window whose resetsAt is already in the past, a reading above the",
+    "critical alert threshold, an envelope warning, and an adapter that",
+    "failed. It also carries labels and token counts wide enough to make the",
+    "row grid choose between ellipsising the label and clipping the figure.",
+    "",
+    "Timestamps are fixed, so the further past generatedAt you read this, the",
+    "more of the resetsAt values fall into the past. That is fine for the",
+    "cases above but means the 'resets in' wording eventually stops being",
+    "exercised; regenerate the block if you are working on that path."
+  ],
+  "results": [
+    {
+      "ok": true,
+      "id": "claude-code",
+      "readings": [
+        {
+          "provider": "claude-code",
+          "label": "Max 20x",
+          "window": "session",
+          "used": 194600,
+          "limit": null,
+          "unit": "tokens",
+          "windowStart": "2026-09-11T10:00:00.000Z",
+          "resetsAt": "2026-09-11T15:00:00.000Z",
+          "estimatedCostUsd": 32.65,
+          "confidence": "derived",
+          "note": "no cap known for \"Max 20x\"; set providers.claude-code.sessionLimit to get a percentage"
+        },
+        {
+          "provider": "claude-code",
+          "label": "Max 20x",
+          "window": "weekly",
+          "used": 6000000,
+          "limit": 8000000,
+          "unit": "tokens",
+          "windowStart": "2026-09-07T00:00:00.000Z",
+          "resetsAt": "2026-09-14T00:00:00.000Z",
+          "estimatedCostUsd": 902.26,
+          "confidence": "derived",
+          "note": "cap came from providers.claude-code.weeklyLimit in your config, not from Anthropic"
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "id": "codex",
+      "readings": [
+        {
+          "provider": "codex",
+          "label": "Plus",
+          "window": "session",
+          "used": 0,
+          "limit": 100,
+          "unit": "percent",
+          "windowStart": "2026-09-07T08:31:55.000Z",
+          "resetsAt": "2026-09-07T13:31:55.000Z",
+          "confidence": "reported",
+          "note": "OpenAI's own figure; NOT LIVE: snapshot is 4d old; ALREADY RESET: this window ended, so it says nothing about the window you are in now"
+        },
+        {
+          "provider": "codex",
+          "label": "Plus",
+          "window": "weekly",
+          "used": 91.4,
+          "limit": 100,
+          "unit": "percent",
+          "windowStart": "2026-09-07T08:31:55.000Z",
+          "resetsAt": "2026-09-14T08:31:55.000Z",
+          "confidence": "reported",
+          "note": "OpenAI's own figure, read from the newest rollout"
+        }
+      ]
+    },
+    {
+      "ok": false,
+      "id": "copilot",
+      "error": "not connected"
+    }
+  ]
+}

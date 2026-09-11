@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# TypeScript build output
+dist/
+*.tsbuildinfo
+
+# Rust / Tauri build artifacts
+# target/ reaches several GB on a debug build. Never commit it.
+src-tauri/target/
+src-tauri/gen/
+
+# The compiled sidecar. Built by `npm run build:sidecar`, roughly 76 MB, and
+# platform-specific. src-tauri/tauri.bundle.conf.json declares it for packaging
+# only, so a fresh clone still builds without it present.
+src-tauri/binaries/
+
+# Captured from whoever ran it, so it carries that person's real plan, token
+# counts and spend. Regenerate locally with `npm run ui:fixture`. The committed
+# ui/fixture.sample.json is the sanitised stand-in the UI falls back to.
+ui/fixture.json
+
+# Local configuration and anything holding a credential.
+# Secrets belong in the OS keychain, never in a file in this repo.
+.env
+.env.*
+*.local
+config.local.yaml
+
+# Editor and OS noise
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test and coverage output
+coverage/
+.nyc_output/
+*.log
+
+# SEA sidecar build output. `npm run build:sidecar` writes a ~76 MB executable
+# here; src-tauri/tauri.bundle.conf.json picks it up at packaging time only, so
+# a fresh clone builds fine without it.
+build/
