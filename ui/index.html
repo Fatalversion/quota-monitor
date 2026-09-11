@@ -237,8 +237,23 @@
       }
 
       /** Ask Rust to fit the window to the content; provider count varies. */
+      /*
+       * Measure on EVERY paint, collapsed or not.
+       *
+       * This used to bail out whenever the dock was collapsed, on the
+       * reasonable-sounding grounds that there is no panel on screen to size.
+       * But the stored size is what the next hover animates TOWARD, so leaving
+       * it stale while collapsed meant a provider toggled off the widget was
+       * followed by an expand aimed at the old size, which stopped part-way and
+       * sat there until the 60-second poll happened to correct it. Fifteen
+       * freezes in twenty toggles, measured.
+       *
+       * The `measuring` class now makes the panel measurable while hidden, so
+       * the stored size is always current and the animation always has a true
+       * target.
+       */
       function fitWindow() {
-        if (!invoke || body.dataset.mode !== 'panel') return;
+        if (!invoke) return;
         requestAnimationFrame(() => {
           // `measuring` frees the panel from the card's fixed height and from
           // its own scrolling, so it reports the size it WANTS. Without it the

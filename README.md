@@ -82,11 +82,15 @@ To get percentages for Claude Code, give it a denominator you measured.
 2. Run `quota --json` at the same moment and note `used` for each window.
 3. Divide, and put the results in your config.
 
+Worked example. Say `/usage` reports 13% and 90%, and at that moment
+`quota --json` reports 520,000 tokens in the session window and 5,400,000 in
+the week:
+
 ```yaml
 providers:
   claude-code:
-    sessionLimit: 5460000    # 709,837 / 0.13
-    weeklyLimit: 7926000     # 7,133,827 / 0.90
+    sessionLimit: 4000000    # 520,000 / 0.13
+    weeklyLimit: 6000000     # 5,400,000 / 0.90
 ```
 
 Sanity check: the session cap should come out below the weekly one. Percentages

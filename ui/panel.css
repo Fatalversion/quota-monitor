@@ -331,6 +331,28 @@ body[data-pinned="true"] .card {
   height: auto;
   flex: 0 0 auto;
   overflow: visible;
+
+  /*
+   * MEASURABLE EVEN WHILE COLLAPSED.
+   *
+   * `display: none` in rail and bar mode meant the panel could not be measured
+   * unless it was already open, so the stored panel size went stale the moment
+   * anything changed while the dock was collapsed - a provider toggled off, for
+   * instance. The next hover then animated toward that stale size and stopped
+   * part-way, and only the 60-second poll eventually corrected it. Measured
+   * failure rate before this: 15 freezes in 20 toggles.
+   *
+   * Taken out of flow and made invisible rather than merely transparent, so a
+   * measurement cannot paint, cannot be clicked, and cannot affect the layout
+   * of the rail it is briefly sharing a card with. index.html adds and removes
+   * the class inside one animation frame.
+   */
+  display: flex !important;
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .panel.measuring .groups {

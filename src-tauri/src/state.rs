@@ -44,6 +44,19 @@ pub struct AppState {
     /// no longer current stops on its next frame, so a fast hover in-out-in
     /// does not leave two animations fighting over the same window.
     pub strip_generation: AtomicU64,
+    /// Serialises "check the generation, then move the window".
+    ///
+    /// The generation counter alone is not enough, because the check and the
+    /// resize that follows it are two separate steps. A frame that read a
+    /// still-current generation, was then superseded, and only afterwards
+    /// called `set_size` would land ON TOP of whatever superseded it. Measured:
+    /// a correcting re-place put the strip at 320x288, and one millisecond
+    /// later a stale animation frame overwrote it with 154x226 and exited,
+    /// leaving the widget clipped until the next 60-second poll.
+    ///
+    /// Holding this across both steps makes them atomic with respect to each
+    /// other, so the last writer is always the newest one.
+    pub placing: Mutex<()>,
     /// Last state asked for, so a re-place after a monitor change knows which
     /// geometry to restore.
     pub strip_expanded: AtomicBool,
@@ -134,6 +147,7 @@ impl AppState {
             placement_path,
             drag: Mutex::new(None),
             strip_generation: AtomicU64::new(0),
+            placing: Mutex::new(()),
             strip_expanded: AtomicBool::new(false),
             strip_pinned: AtomicBool::new(false),
             strip_panel_size: Mutex::new(crate::strip::PANEL_DEFAULT),

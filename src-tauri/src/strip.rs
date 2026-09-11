@@ -347,6 +347,7 @@ pub fn set_expanded(app: &AppHandle, expanded: bool) -> Result<(), String> {
             let mut complained = false;
 
             for step in 1..=STEPS {
+                // Cheap pre-check so a superseded animation stops sleeping.
                 if state.strip_generation.load(Ordering::SeqCst) != generation {
                     return; // superseded mid-flight
                 }
@@ -369,6 +370,18 @@ pub fn set_expanded(app: &AppHandle, expanded: bool) -> Result<(), String> {
                 // shrink before moving. That holds for all four edges - what
                 // would overhang is always the far side of the window, and
                 // enlarging in place is the only way to push it there.
+                // Re-check INSIDE the placement lock. The pre-check above can
+                // go stale in the microseconds before the write, and a frame
+                // that wrote anyway would land on top of whatever superseded
+                // it - which is exactly how a corrected 320x288 became a
+                // clipped 154x226 one millisecond later.
+                let Ok(_placing) = state.placing.lock() else {
+                    return; // poisoned: someone else is mid-place, do no harm
+                };
+                if state.strip_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+
                 let outcome = if move_before_resize(expanded) {
                     window.set_position(position).and_then(|()| window.set_size(size))
                 } else {
@@ -486,6 +499,12 @@ pub fn set_panel_size(app: &AppHandle, width: f64, height: f64) -> Result<(), St
             .to_string()
     })?;
     let monitor = monitor?;
+    // Bump and place under the same lock the animation frames take, so an
+    // in-flight frame cannot slip its write in between the two and undo this.
+    let _placing = state
+        .placing
+        .lock()
+        .map_err(|_| "the placement lock is poisoned".to_string())?;
     // Any grow still in flight is animating toward the size just replaced.
     state.strip_generation.fetch_add(1, Ordering::SeqCst);
     place(&window, &monitor, placement(app), true, size)
