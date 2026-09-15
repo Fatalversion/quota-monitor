@@ -29,10 +29,10 @@ It also lives in the system tray.
 | Provider | Setup | Figures are |
 | --- | --- | --- |
 | **Codex CLI** | None | Reported by OpenAI |
-| **Claude Code** | None for spend, one step for percentages | Derived |
+| **Claude Code** | None for spend, [one settings entry](#claude-code-percentages) for percentages | Reported by Anthropic once set up, derived otherwise |
 
-Both read files the tool already writes to your disk. Nothing is uploaded and
-no credential is used.
+Both read files the tool already writes to your disk, or data it hands to a
+command you configured. Nothing is uploaded and no credential is used.
 
 **Codex is the better case, and not because of anything we did.** OpenAI writes
 its own `used_percent`, window length and reset time into the Codex rollout
@@ -41,11 +41,80 @@ next run Codex, and the widget says how stale the snapshot is rather than
 presenting an old figure as live.
 
 **Claude Code is the harder case.** The transcripts record every token spent, so
-the numerator is real. Nothing anywhere records the cap. Claude Code's own
+the numerator is real. Nothing on disk records the cap. Claude Code's own
 `/usage` knows it, but it fetches that from Anthropic's servers using the OAuth
 token in your credentials file, and reading another tool's stored credential is
-a line this project does not cross. So out of the box you get real token counts
-and no percentage. See [calibration](#calibration) to get bars.
+a line this project does not cross.
+
+There is one sanctioned way in. Claude Code hands its **status line** command a
+JSON payload that carries Anthropic's own `used_percentage` and reset time for
+the 5-hour and 7-day windows. Point your status line at `quota statusline` and
+those rows become reported figures, exactly like Codex. Without that you get
+real token counts and no percentage, or a percentage you
+[calibrated](#calibration) yourself.
+
+## Claude Code percentages
+
+One settings entry, which you add yourself. quota-monitor never edits Claude
+Code's settings.
+
+1. Print the entry for your install:
+
+   ```bash
+   quota statusline --print-config
+   ```
+
+2. Add the `statusLine` block it prints to `~/.claude/settings.json`. It looks
+   like this, with the path to your own install:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "C:/Users/you/AppData/Local/quota-monitor/quota.exe statusline"
+     }
+   }
+   ```
+
+3. Send Claude Code a message. Your status line now reads
+   `5h 18% (2h 31m) | 7d 39% (5d 02h)`, and the widget's Claude Code rows lose
+   their `~`.
+
+**Already have a status line?** Keep it, and pass the same input on from your
+script without printing anything:
+
+```bash
+input=$(cat)
+echo "$input" | quota statusline --silent
+# ...the rest of your script, unchanged
+```
+
+What `quota statusline` does with the payload: it keeps the four numbers and
+nothing else. The same payload carries your working directory, repository,
+session name and pull request URL, and none of it is stored. The figures go to
+`~/.config/quota-monitor/claude-code-rate-limits.json`.
+
+Things worth knowing, because they are where a reported figure can still
+mislead:
+
+- **Pro and Max plans only.** Claude Code sends no rate limits to API-key users,
+  and none before a session's first response.
+- **Not live.** The figure moves only when a session with the status line gets a
+  response. The widget says how long ago it last changed, and counts the Claude
+  Code calls on this machine since then, which the figure cannot include. Usage
+  on claude.ai, the desktop app or another machine counts against the same
+  limit and shows up only at the next update.
+- **Many sessions, one figure.** An idle session re-renders with whatever its
+  last response carried. Within a window the recorder keeps the highest figure
+  it has seen and a later window replaces an earlier one, so an old session can
+  never drag the number back down.
+- **After a reset** the row falls back to the transcript estimate until Claude
+  Code reports the new window, and says so.
+- **One account per home directory.** Nothing in the payload identifies the
+  account, so switching Claude accounts on one machine mixes their figures.
+- **IDE extensions.** Claude Code's documentation describes the status line for
+  the terminal and does not say whether IDE extensions run the command. If the
+  file above never appears, run `claude` in a terminal once.
 
 ### Not supported, and why
 
@@ -76,7 +145,9 @@ cap in `plans.ts` is now `null` and the comment there records why.
 
 ## Calibration
 
-To get percentages for Claude Code, give it a denominator you measured.
+The fallback, for when the [status line](#claude-code-percentages) is not an
+option. To get percentages for Claude Code without it, give it a denominator
+you measured.
 
 1. Run `/usage` in Claude Code and note the session and weekly percentages.
 2. Run `quota --json` at the same moment and note `used` for each window.
@@ -135,7 +206,7 @@ Needs Node 20+ and, for the desktop widget, the Rust toolchain.
 
 ```bash
 npm install
-npm test              # 679 tests
+npm test              # 741 tests
 npm run dev           # the CLI, prints a readout
 npm run dev -- --json # machine-readable
 
@@ -154,7 +225,7 @@ fixture with no toolchain at all.
 
 - Read `~/.claude/.credentials.json`, `~/.codex/auth.json`, or any other tool's stored token. Not even though it is local, easy, and would remove the last bit of setup.
 - Send telemetry, analytics or crash reports. There is nothing to opt out of.
-- Write to another tool's files, or make any network call from the desktop shell.
+- Write to another tool's files, or make any network call from the desktop shell. That includes Claude Code's settings: you add the status line entry yourself.
 - Spend quota to measure quota.
 - Scrape a provider's web interface, drive it with browser automation, or read session cookies.
 - Grow a paid tier, a licence key, or an upsell.

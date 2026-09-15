@@ -140,10 +140,32 @@ export type { RenderOptions } from './cli/render.js';
 export {
   DISPLAY_NAME as CLAUDE_CODE_DISPLAY_NAME,
   MAX_TRANSCRIPT_FILES,
+  PERCENT_LIMIT as CLAUDE_CODE_PERCENT_LIMIT,
   PROVIDER_ID as CLAUDE_CODE_PROVIDER_ID,
   claudeCodeAdapter,
 } from './providers/claude-code/index.js';
 export type { ClaudeCodeOptions } from './providers/claude-code/index.js';
+
+/**
+ * Anthropic's own percentages, recorded from Claude Code's status line. The
+ * formatting helpers are left out on purpose: `formatPercent` already names
+ * the renderer's, and one name must not mean two functions.
+ */
+export {
+  formatStatusLine,
+  parseStatusLinePayload,
+  readRateLimitSnapshot,
+  recordStatusLine,
+  statusLineSnapshotPath,
+} from './providers/claude-code/statusline.js';
+export type {
+  LimitWindow,
+  ObservedLimits,
+  ObservedWindow,
+  RateLimitSnapshot,
+  RecordResult,
+  SnapshotWindow,
+} from './providers/claude-code/statusline.js';
 
 export { PLANS, PLAN_IDS, assertPlanTableShape, planFor } from './providers/claude-code/plans.js';
 export type { PlanCaps, PlanId } from './providers/claude-code/plans.js';

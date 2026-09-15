@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -293,7 +293,10 @@ describe('run', () => {
     const { out } = await invoke(['--help']);
     expect(out).toContain('A "~" before a percentage means the denominator is our estimate');
     expect(out).toContain('came from the provider itself');
-    expect(out).toContain('only move when you next run Codex');
+    // Both reported sources are named, and so is the fact that neither is live.
+    expect(out).toContain('the Codex rollout logs');
+    expect(out).toContain("from Claude Code's status line");
+    expect(out).toContain('only move when that tool next gets a');
   });
 
   it('emits no ANSI escapes when the terminal is not colour capable', async () => {
@@ -551,5 +554,134 @@ describe('run', () => {
 
     const bars = (text: string): number => (text.match(/[#-]/g) ?? []).length;
     expect(bars(wide.out)).toBeGreaterThan(bars(narrow.out));
+  });
+});
+
+describe('quota statusline', () => {
+  const HOUR = 3_600_000;
+
+  /** A status line payload in the documented shape, with its personal context. */
+  function statusPayload(fiveHour: number | null, sevenDay: number | null): string {
+    const at = (ms: number) => Math.floor((NOW.getTime() + ms) / 1000);
+    const rateLimits: Record<string, unknown> = {};
+    if (fiveHour !== null) rateLimits['five_hour'] = { used_percentage: fiveHour, resets_at: at(2 * HOUR + 31 * 60_000) };
+    if (sevenDay !== null) rateLimits['seven_day'] = { used_percentage: sevenDay, resets_at: at(5 * 24 * HOUR) };
+    return JSON.stringify({
+      cwd: '/home/someone/secret-project',
+      session_name: 'secret session',
+      ...(fiveHour === null && sevenDay === null ? {} : { rate_limits: rateLimits }),
+    });
+  }
+
+  function piped(text: string): Partial<CliEnvironment> {
+    return { readStdin: async () => text, stdinIsTTY: () => false };
+  }
+
+  function snapshotFile(home: string): string {
+    return join(home, '.config', 'quota-monitor', 'claude-code-rate-limits.json');
+  }
+
+  it('records the figures and prints them back as a status line', async () => {
+    const home = await makeTempDir();
+    const { code, out, err } = await invoke(['statusline'], {
+      homeDir: home,
+      ...piped(statusPayload(18, 39)),
+    });
+
+    expect(code).toBe(EXIT_OK);
+    expect(err).toBe('');
+    expect(out).toBe('5h 18% (2h 31m) | 7d 39% (5d 00h)');
+
+    const saved = await readFile(snapshotFile(home), 'utf8');
+    expect(saved).toContain('"five_hour"');
+    expect(saved).not.toContain('secret');
+  });
+
+  it('records but prints nothing with --silent', async () => {
+    const home = await makeTempDir();
+    const { code, out } = await invoke(['statusline', '--silent'], {
+      homeDir: home,
+      ...piped(statusPayload(18, 39)),
+    });
+    expect(code).toBe(EXIT_OK);
+    expect(out).toBe('');
+    expect(await readFile(snapshotFile(home), 'utf8')).toContain('"seven_day"');
+  });
+
+  it('prints and writes nothing for a payload without rate limits, and still exits 0', async () => {
+    const home = await makeTempDir();
+    const { code, out } = await invoke(['statusline'], {
+      homeDir: home,
+      ...piped(statusPayload(null, null)),
+    });
+    expect(code).toBe(EXIT_OK);
+    expect(out).toBe('');
+    await expect(readFile(snapshotFile(home), 'utf8')).rejects.toThrow();
+  });
+
+  it('shows the freshest figure any session recorded, not just this one', async () => {
+    const home = await makeTempDir();
+    await invoke(['statusline', '--silent'], { homeDir: home, ...piped(statusPayload(60, 40)) });
+    // An idle session re-rendering with its older, lower figures.
+    const { out } = await invoke(['statusline'], { homeDir: home, ...piped(statusPayload(20, 35)) });
+    expect(out).toBe('5h 60% (2h 31m) | 7d 40% (5d 00h)');
+  });
+
+  it('never throws on garbage input', async () => {
+    const home = await makeTempDir();
+    const { code, out } = await invoke(['statusline'], { homeDir: home, ...piped('{{not json') });
+    expect(code).toBe(EXIT_OK);
+    expect(out).toBe('');
+  });
+
+  it('still prints the figures when the snapshot cannot be written', async () => {
+    const home = await makeTempDir();
+    await writeFile(join(home, '.config'), 'a file where a directory should be', 'utf8');
+    const { code, out } = await invoke(['statusline'], {
+      homeDir: home,
+      ...piped(statusPayload(18, null)),
+    });
+    expect(code).toBe(EXIT_OK);
+    expect(out).toBe('5h 18% (2h 31m)');
+  });
+
+  it('explains itself instead of waiting forever when nothing is piped in', async () => {
+    const { code, err } = await invoke(['statusline'], {
+      readStdin: async () => {
+        throw new Error('stdin must not be read from a terminal');
+      },
+      stdinIsTTY: () => true,
+    });
+    expect(code).toBe(EXIT_FAILURE);
+    expect(err).toContain('--print-config');
+  });
+
+  it('rejects an unknown statusline option', async () => {
+    const { code, err } = await invoke(['statusline', '--json'], piped(''));
+    expect(code).toBe(EXIT_FAILURE);
+    expect(err).toContain('unknown statusline option "--json"');
+  });
+
+  it('prints a settings entry that runs this command, and edits nothing', async () => {
+    const home = await makeTempDir();
+    const { code, out, err } = await invoke(['statusline', '--print-config'], { homeDir: home });
+
+    expect(code).toBe(EXIT_OK);
+    const entry = JSON.parse(out) as { statusLine: { type: string; command: string } };
+    expect(entry.statusLine.type).toBe('command');
+    expect(entry.statusLine.command.endsWith(' statusline')).toBe(true);
+    expect(entry.statusLine.command).not.toContain('\\');
+    expect(err).toContain('does not edit');
+    await expect(readFile(snapshotFile(home), 'utf8')).rejects.toThrow();
+  });
+
+  it('documents itself', async () => {
+    const { code, out } = await invoke(['statusline', '--help']);
+    expect(code).toBe(EXIT_OK);
+    expect(out).toContain('--silent');
+    expect(out).toContain('--print-config');
+
+    const top = await invoke(['--help']);
+    expect(top.out).toContain('statusline');
   });
 });

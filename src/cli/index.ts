@@ -11,8 +11,9 @@
  *  - NO DEPENDENCY. argv is parsed by hand below. A flag parser is not worth a
  *    supply chain.
  *  - NO NETWORK, NO TELEMETRY. Nothing in this file or anything it imports
- *    opens a socket. The only files read are the user's own config and, via
- *    the adapters, other tools' logs.
+ *    opens a socket. The only files read are the user's own config, the
+ *    status line snapshot, and, via the adapters, other tools' logs. The only
+ *    file ever written is that snapshot, by `quota statusline`.
  *  - EXIT 0 UNLESS WE ARE BROKEN. A provider that failed is data, not a
  *    program error: it prints as a failed row and the exit code stays 0. Exit
  *    1 is reserved for a usage error or a crash - things where a script that
@@ -33,6 +34,13 @@ import { collect, createRegistry } from '../core/registry.js';
 import { defaultSecretStore } from '../core/secrets.js';
 import { percentUsed } from '../core/types.js';
 import { claudeCodeAdapter } from '../providers/claude-code/index.js';
+import {
+  MAX_PAYLOAD_BYTES,
+  formatStatusLine,
+  parseStatusLinePayload,
+  recordStatusLine,
+  statusLineSnapshotPath,
+} from '../providers/claude-code/statusline.js';
 import { codexAdapter } from '../providers/codex/index.js';
 import { renderAll } from './render.js';
 
@@ -233,6 +241,56 @@ export interface CliEnvironment {
   colorCapable: boolean;
   /** Adapters to run. Defaults to the built-in set. */
   adapters: readonly QuotaAdapter[];
+  /**
+   * Everything on stdin, for `quota statusline`. A function so the real stdin
+   * stream is never touched by any other command.
+   */
+  readStdin(): Promise<string>;
+  /** Whether stdin is a terminal, meaning nothing was piped in. */
+  stdinIsTTY(): boolean;
+}
+
+/**
+ * How long `quota statusline` waits for stdin to close.
+ *
+ * Claude Code writes the payload and closes the pipe at once, so this only
+ * bites on a caller that never closes it - and a status line command that
+ * hangs would otherwise pile up behind every update.
+ */
+const STDIN_TIMEOUT_MS = 3_000;
+
+/** Read stdin to the end, capped in size and in time. Never rejects. */
+function readProcessStdin(): Promise<string> {
+  return new Promise((resolveText) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let overflow = false;
+    let settled = false;
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.removeAllListeners('data');
+      process.stdin.destroy();
+      // An oversized payload is not one Claude Code sends; treat it as none.
+      resolveText(overflow ? '' : Buffer.concat(chunks).toString('utf8'));
+    };
+
+    const timer = setTimeout(finish, STDIN_TIMEOUT_MS);
+    process.stdin.on('data', (chunk: Buffer | string) => {
+      const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+      size += bytes.length;
+      if (size > MAX_PAYLOAD_BYTES) {
+        overflow = true;
+        finish();
+        return;
+      }
+      chunks.push(bytes);
+    });
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
+  });
 }
 
 /**
@@ -262,6 +320,8 @@ function defaultEnvironment(): CliEnvironment {
     env: process.env,
     colorCapable: process.stdout.isTTY === true,
     adapters: builtinAdapters(),
+    readStdin: readProcessStdin,
+    stdinIsTTY: () => process.stdin.isTTY === true,
   };
 }
 
@@ -276,6 +336,8 @@ function withDefaults(overrides?: Partial<CliEnvironment>): CliEnvironment {
     env: overrides.env ?? base.env,
     colorCapable: overrides.colorCapable ?? base.colorCapable,
     adapters: overrides.adapters ?? base.adapters,
+    readStdin: overrides.readStdin ?? base.readStdin,
+    stdinIsTTY: overrides.stdinIsTTY ?? base.stdinIsTTY,
   };
 }
 
@@ -288,6 +350,11 @@ function helpText(): string {
     `${PROGRAM} - how much of each AI coding subscription you have burned`,
     '',
     `Usage: ${PROGRAM} [options]`,
+    `       ${PROGRAM} statusline [--silent | --print-config]`,
+    '',
+    'Commands:',
+    '  statusline        record Anthropic\'s own Claude Code usage percentages from',
+    '                    Claude Code\'s status line; see "quota statusline --help"',
     '',
     'Options:',
     '  --json            print a JSON envelope instead of the widget',
@@ -303,17 +370,149 @@ function helpText(): string {
     'Reading the output:',
     '  A "~" before a percentage means the denominator is our estimate, not a',
     '  figure the provider published. Nothing in ~/.claude records a plan cap,',
-    '  so every Claude Code percentage is derived from the plan table and from',
-    '  whatever you set in config. Run with --verbose to see exactly where each',
-    '  denominator came from, then override it with a limit you have measured.',
+    '  so a Claude Code percentage is derived from the plan table and from',
+    '  whatever you set in config - unless "quota statusline" is recording',
+    '  Anthropic\'s own figure. Run with --verbose to see where each came from.',
     '',
-    '  A percentage with no "~" came from the provider itself. Codex records the',
-    '  used_percent OpenAI puts in its rollout logs, so those rows are reported',
-    '  rather than estimated - but they only move when you next run Codex. Use',
-    '  --verbose to see how old the snapshot behind each one is.',
+    '  A percentage with no "~" came from the provider itself: OpenAI\'s',
+    '  used_percent from the Codex rollout logs, or Anthropic\'s used_percentage',
+    '  from Claude Code\'s status line. Both only move when that tool next gets a',
+    '  response. Use --verbose to see how old the figure behind each one is.',
     '',
-    'This tool is read-only, makes no network calls, and sends no telemetry.',
+    'This tool never writes to another tool\'s files, makes no network calls, and',
+    'sends no telemetry. The one file it writes is its own status line snapshot.',
   ].join('\n');
+}
+
+function statusLineHelp(homeDir: string): string {
+  return [
+    `Usage: ${PROGRAM} statusline [--silent | --print-config]`,
+    '',
+    'Claude Code hands its status line command a JSON payload on stdin that',
+    'carries Anthropic\'s own usage percentages for the 5-hour and 7-day windows.',
+    'Point the status line at this command and quota-monitor shows those figures',
+    'instead of estimates. Only Pro and Max plans receive them.',
+    '',
+    'Options:',
+    '  (none)            record the figures and print a short status line',
+    '  --silent          record the figures and print nothing, for calling from',
+    '                    a status line script you already have',
+    '  --print-config    print the settings entry to add to ~/.claude/settings.json',
+    '  -h, --help        show this help',
+    '',
+    'Already have a status line? Keep it, and pass the same input on from your',
+    `script, for example:  echo "$input" | ${PROGRAM} statusline --silent`,
+    '',
+    `Figures are recorded to ${statusLineSnapshotPath(homeDir)}.`,
+    'quota-monitor never edits Claude Code\'s settings for you.',
+  ].join('\n');
+}
+
+/* -------------------------------------------------------------------------- */
+/* the statusline command                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Forward slashes: Git Bash, which Claude Code uses on Windows, eats backslashes. */
+function forwardSlashes(path: string): string {
+  return path.replaceAll('\\', '/');
+}
+
+function quoteIfNeeded(path: string): string {
+  return /\s/.test(path) ? `"${path}"` : path;
+}
+
+/**
+ * The command a user should put in `statusLine.command` to reach THIS install.
+ *
+ * The single-file build stamps a version global (see `readVersion`), which is
+ * how it knows it is its own executable. Anything else runs under Node, and a
+ * TypeScript entry run through tsx is mapped to its compiled `dist` twin,
+ * because Claude Code will run plain `node`.
+ */
+function statusLineCommand(): string {
+  const stamped: unknown = (globalThis as Record<string, unknown>)[VERSION_STAMP];
+  if (typeof stamped === 'string' && stamped.trim() !== '') {
+    return `${quoteIfNeeded(forwardSlashes(process.execPath))} statusline`;
+  }
+
+  let script = process.argv[1] ?? fileURLToPath(import.meta.url);
+  try {
+    script = realpathSync(script);
+  } catch {
+    // Keep the unresolved path; it is still the best guess available.
+  }
+  script = forwardSlashes(script).replace(/\/src\/cli\/index\.ts$/, '/dist/cli/index.js');
+  return `node ${quoteIfNeeded(script)} statusline`;
+}
+
+function printStatusLineConfig(env: CliEnvironment): number {
+  const command = statusLineCommand();
+  const entry = { statusLine: { type: 'command', command } };
+  env.stdout(JSON.stringify(entry, null, 2));
+
+  env.stderr('');
+  env.stderr('Add the "statusLine" entry above to ~/.claude/settings.json.');
+  env.stderr('quota-monitor does not edit Claude Code\'s settings for you.');
+  env.stderr('Already have a status line? Keep it, and add this to your script instead:');
+  env.stderr(`  echo "$input" | ${command} --silent`);
+  if (command.startsWith('node ')) {
+    env.stderr('This runs the compiled CLI with node from your PATH; run "npm run build" first.');
+  }
+  if (process.platform === 'win32' && command.startsWith('"')) {
+    env.stderr(
+      'The quoted path suits Git Bash, which Claude Code uses on Windows when it is installed. ' +
+        'Without Git Bash, Claude Code uses PowerShell, which needs the line to start with "& ".',
+    );
+  }
+  return EXIT_OK;
+}
+
+/**
+ * `quota statusline`: record the payload, print a line, never break the bar.
+ *
+ * Claude Code shows whatever this prints and shows nothing if it fails, so the
+ * status bar is the user's and not ours to blank. A write that fails still
+ * prints the figures the payload carried, and the exit code stays 0 for every
+ * outcome except a usage mistake a human made at a terminal.
+ */
+async function runStatusLine(argv: readonly string[], env: CliEnvironment): Promise<number> {
+  let silent = false;
+  for (const arg of argv) {
+    if (arg === '--help' || arg === '-h') {
+      env.stdout(statusLineHelp(env.homeDir));
+      return EXIT_OK;
+    }
+    if (arg === '--print-config') return printStatusLineConfig(env);
+    if (arg === '--silent') {
+      silent = true;
+      continue;
+    }
+    env.stderr(`${PROGRAM}: unknown statusline option "${arg}"`);
+    env.stderr(`Try '${PROGRAM} statusline --help'.`);
+    return EXIT_FAILURE;
+  }
+
+  if (env.stdinIsTTY()) {
+    env.stderr(`${PROGRAM}: statusline reads Claude Code's status line JSON on stdin.`);
+    env.stderr(`Run '${PROGRAM} statusline --print-config' to set it up.`);
+    return EXIT_FAILURE;
+  }
+
+  const payload = await env.readStdin();
+  const now = env.now();
+
+  let line: string;
+  try {
+    const recorded = await recordStatusLine(payload, statusLineSnapshotPath(env.homeDir), now);
+    line = formatStatusLine(recorded.snapshot.windows, now);
+  } catch {
+    // The snapshot could not be written. Show what this payload carried rather
+    // than nothing; the next update tries the write again.
+    line = formatStatusLine(parseStatusLinePayload(payload, now), now);
+  }
+
+  if (!silent && line !== '') env.stdout(line);
+  return EXIT_OK;
 }
 
 /**
@@ -426,6 +625,16 @@ export async function run(
   overrides?: Partial<CliEnvironment>,
 ): Promise<number> {
   const env = withDefaults(overrides);
+
+  // The one subcommand. Dispatched before option parsing so that its flags do
+  // not have to be valid flags for the report as well.
+  if (argv[0] === 'statusline') {
+    try {
+      return await runStatusLine(argv.slice(1), env);
+    } catch {
+      return EXIT_OK;
+    }
+  }
 
   const parsed = parseArgs(argv);
   if (!parsed.ok) {

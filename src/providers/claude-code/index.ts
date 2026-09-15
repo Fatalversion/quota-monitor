@@ -5,17 +5,26 @@
  * honest rows: how much of the current session window and of the current week
  * has been burned.
  *
- * WHY EVERY READING IS `derived`, WITHOUT EXCEPTION
- * -------------------------------------------------
- * The numerator is real. It is summed from `usage` objects Claude Code wrote
- * into its own session transcripts, and nothing here invents a token.
+ * TWO SOURCES, AND A READING ALWAYS SAYS WHICH
+ * --------------------------------------------
+ * Nothing under ~/.claude records a rate limit, a plan cap, a quota percentage
+ * or a window reset time - we searched. The one place Anthropic's own figure
+ * leaves Claude Code is the JSON its status line command receives on stdin, and
+ * it reaches us only when the user has pointed that command at
+ * `quota statusline`, which records it into quota-monitor's own directory (see
+ * `./statusline.ts`). So each window is one of:
  *
- * The denominator is not. Nothing anywhere under ~/.claude records a rate
- * limit, a plan cap, a quota percentage or a window reset time - we searched.
- * So every limit printed by this adapter comes either from the user's config
- * or from the community-estimate table in `./plans.ts`, and the reading says
- * so in its `note`. `confidence` is hard-coded to 'derived' below; there is no
- * code path that produces 'reported'.
+ *   - `reported`, when that snapshot holds a figure for the window and the
+ *     window has not reset. `unit: 'percent'`, `limit: 100`, `used` and the
+ *     reset time are Anthropic's, and the tokens and cost in the note are
+ *     counted over that same window rather than over our estimate of it. The
+ *     note states how old the figure is and how many calls this machine has
+ *     made since, because the figure cannot include them.
+ *   - `derived`, otherwise. The numerator is real, summed from `usage` objects
+ *     Claude Code wrote into its transcripts, and nothing here invents a token.
+ *     The denominator is not: it comes from the user's config or from the
+ *     community-estimate table in `./plans.ts`, and the note says which. No
+ *     branch labels a percentage computed from transcripts 'reported'.
  *
  * WHAT `used` COUNTS
  * ------------------
@@ -60,12 +69,15 @@
  * Claude Code daily.
  *
  * The weekly window is untouched. It is calendar-anchored, it was measured
- * against the same transcripts, and it was already right.
+ * against the same transcripts, and it was already right. None of this applies
+ * to a window Anthropic reported: its bounds are Anthropic's, so there is no
+ * anchor to search for and the widening search above is skipped.
  *
  * SAFETY
  * ------
- * Read-only, and narrow. Every file this adapter opens comes from
- * `listTranscripts`, whose allowlist is `projects/<dir>/<name>.jsonl`. It
+ * Read-only, and narrow. Every transcript this adapter opens comes from
+ * `listTranscripts`, whose allowlist is `projects/<dir>/<name>.jsonl`, and the
+ * only other file it reads is quota-monitor's own status line snapshot. It
  * never reads `.credentials.json`, never reads a `*.key`, never writes
  * anything, and makes no network call.
  */
@@ -83,6 +95,12 @@ import {
 import { UNDETECTED, detectPlan } from './detect-plan.js';
 import { parseLine, usageEventKey } from './parse.js';
 import { planFor } from './plans.js';
+import {
+  LIMIT_WINDOW_MS,
+  formatPercent,
+  readRateLimitSnapshot,
+  statusLineSnapshotPath,
+} from './statusline.js';
 import {
   MAX_LINE_LENGTH,
   claudeHomeDir,
@@ -102,6 +120,7 @@ import type {
 import type { AnchoredWindow } from '../../core/window.js';
 import type { DetectedPlan } from './detect-plan.js';
 import type { PlanCaps } from './plans.js';
+import type { LimitWindow, RateLimitSnapshot, SnapshotWindow } from './statusline.js';
 
 /** Adapter id. Matches the directory name and the config key. */
 export const PROVIDER_ID = 'claude-code';
@@ -938,6 +957,19 @@ function buildNote(
       `${group(scan.scanned)} ${plural(scan.scanned, 'transcript')}`,
   );
 
+  parts.push(...scanDisclosures(totals, opts, scan));
+
+  return parts.join('; ');
+}
+
+/**
+ * What the transcript scan could not fully account for. Shared by the derived
+ * and the reported notes: a reported percentage does not make the token and
+ * cost figures beside it any more complete than the scan behind them.
+ */
+function scanDisclosures(totals: WindowTotals, opts: ResolvedOptions, scan: ScanSummary): string[] {
+  const parts: string[] = [];
+
   if (scan.truncatedFrom !== null) {
     parts.push(
       `TRUNCATED: ${group(scan.truncatedFrom)} transcripts matched this window but only the ` +
@@ -965,7 +997,205 @@ function buildNote(
     );
   }
 
+  return parts;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Anthropic's own figure, from the status line snapshot                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The denominator of a reported reading. Not a cap anybody looked up: `used`
+ * is already Anthropic's percentage, so pairing it with 100 keeps
+ * `percentUsed()` honest - exactly as the Codex adapter does.
+ */
+export const PERCENT_LIMIT = 100;
+
+/**
+ * How long after a figure was recorded a transcript call still counts as
+ * already inside it.
+ *
+ * The status line runs about 300 ms after a response arrives and the
+ * transcript is stamped when the response began, so the two instants are
+ * seconds apart by construction. A minute absorbs that without hiding a real
+ * call made afterwards for long.
+ */
+export const REPORTED_ACTIVITY_GRACE_MS = 60_000;
+
+const LIMIT_LABEL: Readonly<Record<LimitWindow, string>> = Object.freeze({
+  five_hour: '5-hour',
+  seven_day: '7-day',
+});
+
+/** A window from the snapshot that has not reset yet, or null. */
+function liveReported(
+  snapshot: RateLimitSnapshot | null,
+  window: LimitWindow,
+  nowMs: number,
+): SnapshotWindow | null {
+  const entry = snapshot?.windows[window];
+  if (entry === undefined) return null;
+  return entry.resetsAt.getTime() > nowMs ? entry : null;
+}
+
+/**
+ * The bounds of a reported window. Claude Code sends only the reset time, and
+ * these are fixed-length windows, so the reset minus the length is the only
+ * start there is - the note says so.
+ */
+function reportedRange(entry: SnapshotWindow, window: LimitWindow): { start: Date; end: Date } {
+  return {
+    start: new Date(entry.resetsAt.getTime() - LIMIT_WINDOW_MS[window]),
+    end: entry.resetsAt,
+  };
+}
+
+/**
+ * Why a derived reading is not a reported one, when that is worth saying.
+ *
+ * The first case is the discoverability case: someone reading `--verbose` has
+ * the estimate in front of them and should learn in the same breath that the
+ * real figure is one settings entry away.
+ */
+function statusLineNotePart(
+  snapshot: RateLimitSnapshot | null,
+  window: LimitWindow,
+  nowMs: number,
+): string {
+  const label = LIMIT_LABEL[window];
+  if (snapshot === null) {
+    return (
+      `Anthropic's own ${label} percentage is available from Claude Code's status line: run ` +
+      `"quota statusline --print-config" and add what it prints to your Claude Code settings, ` +
+      `and this row shows that figure instead of an estimate`
+    );
+  }
+
+  const entry = snapshot.windows[window];
+  if (entry === undefined) {
+    return (
+      `the status line recorder has not seen a ${label} figure yet - Claude Code sends one ` +
+      `only to Pro and Max plans, and only after a session's first response`
+    );
+  }
+
+  return (
+    `Anthropic's last reported ${label} figure, ${formatPercent(entry.usedPercentage)}, was for ` +
+    `a window that ended at ${entry.resetsAt.toISOString()}; this estimate stands in until a ` +
+    `Claude Code session with the status line gets its next response`
+  );
+}
+
+/** Calls stamped after `sinceMs`, from the timestamps the scan collected. */
+function callsAfter(stamps: readonly number[], sinceMs: number, nowMs: number): number {
+  let count = 0;
+  for (const ms of stamps) {
+    if (ms > sinceMs && ms <= nowMs) count += 1;
+  }
+  return count;
+}
+
+/** 90_000 -> '1m', 7_500_000 -> '2h 05m'. Local, so providers never import the CLI. */
+function formatAge(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 60_000) return 'less than a minute';
+  const minutes = Math.floor(ms / 60_000);
+  if (ms < MS_PER_HOUR) return `${minutes}m`;
+  const wholeHours = Math.floor(ms / MS_PER_HOUR);
+  if (wholeHours < 48) return `${wholeHours}h ${String(minutes % 60).padStart(2, '0')}m`;
+  return `${Math.floor(wholeHours / 24)}d ${String(wholeHours % 24).padStart(2, '0')}h`;
+}
+
+function buildReportedNote(
+  acc: WindowAccumulator,
+  totals: WindowTotals,
+  entry: SnapshotWindow,
+  window: LimitWindow,
+  opts: ResolvedOptions,
+  scan: ScanSummary,
+  stamps: readonly number[],
+  nowMs: number,
+): string {
+  const parts: string[] = [];
+  const label = LIMIT_LABEL[window];
+  const pct = formatPercent(entry.usedPercentage);
+
+  parts.push(
+    `${pct} of the ${label} limit is Anthropic's own figure (rate_limits.${window}` +
+      `.used_percentage, recorded from Claude Code's status line) - quota-monitor never ` +
+      `recomputes it from token counts`,
+  );
+
+  const observedMs = entry.observedAt.getTime();
+  const age = `${formatAge(nowMs - observedMs)} ago (${entry.observedAt.toISOString()})`;
+  const since = callsAfter(stamps, observedMs + REPORTED_ACTIVITY_GRACE_MS, nowMs);
+
+  // The figure cannot include a call made after it was recorded, and those
+  // calls are sitting in the transcripts. Counting them turns "this might be
+  // stale" into a statement of how stale.
+  parts.push(
+    since > 0
+      ? `BEHIND: the figure last changed ${age}, and ${group(since)} Claude Code ` +
+          `${plural(since, 'call')} recorded on this machine since then ${plural(since, 'is', 'are')} ` +
+          `not in it, so the real figure is higher - it catches up the next time a session ` +
+          `with the status line gets a response`
+      : `the figure last changed ${age} and no Claude Code call has been recorded on this ` +
+          `machine since; usage on the same plan elsewhere (claude.ai, the desktop app, ` +
+          `another machine) still counts against it and cannot show here`,
+  );
+
+  if (entry.clamped) {
+    parts.push(`Claude Code sent a used_percentage outside 0-100, shown clamped to ${pct}`);
+  }
+
+  if (acc.start !== null) {
+    parts.push(
+      `the window resets at ${entry.resetsAt.toISOString()}; its start, ` +
+        `${acc.start.toISOString()}, is that reset minus ${span(LIMIT_WINDOW_MS[window])}, ` +
+        `because Claude Code reports only when a window resets`,
+    );
+  }
+
+  parts.push(
+    `the cost estimate covers ${group(acc.calls)} ${plural(acc.calls, 'call')} inside this ` +
+      `same window across ${group(scan.scanned)} ${plural(scan.scanned, 'transcript')}: ` +
+      `${compact(totals.tokens.input + totals.tokens.output)} input + output, ` +
+      `${compact(totals.tokens.cacheRead)} cache-read and ` +
+      `${compact(totals.tokens.cacheCreation)} cache-write tokens`,
+  );
+
+  parts.push(...scanDisclosures(totals, opts, scan));
+
   return parts.join('; ');
+}
+
+function buildReportedReading(
+  acc: WindowAccumulator,
+  entry: SnapshotWindow,
+  window: LimitWindow,
+  opts: ResolvedOptions,
+  scan: ScanSummary,
+  stamps: readonly number[],
+  nowMs: number,
+): QuotaReading {
+  const totals = totalsOf(acc);
+
+  const reading: QuotaReading = {
+    provider: PROVIDER_ID,
+    label: opts.plan.label,
+    window: acc.window,
+    used: entry.usedPercentage,
+    limit: PERCENT_LIMIT,
+    unit: 'percent',
+    windowStart: acc.start === null ? null : acc.start.toISOString(),
+    resetsAt: entry.resetsAt.toISOString(),
+    // The one branch that may say this, and only because the figure is
+    // Anthropic's, carried here verbatim from Claude Code's status line.
+    confidence: 'reported',
+  };
+
+  if (totals.costUsd !== null) reading.estimatedCostUsd = totals.costUsd;
+  reading.note = buildReportedNote(acc, totals, entry, window, opts, scan, stamps, nowMs);
+  return reading;
 }
 
 function buildReading(
@@ -973,6 +1203,7 @@ function buildReading(
   opts: ResolvedOptions,
   scan: ScanSummary,
   anchor: AnchorReport | null = null,
+  extra: string | null = null,
 ): QuotaReading {
   const totals = totalsOf(acc);
 
@@ -997,7 +1228,9 @@ function buildReading(
   // the renderer stay silent instead of printing a $0.00 that reads as free.
   if (totals.costUsd !== null) reading.estimatedCostUsd = totals.costUsd;
 
-  const note = buildNote(acc, totals, opts, scan, anchor);
+  const note = [buildNote(acc, totals, opts, scan, anchor), extra ?? '']
+    .filter((part) => part !== '')
+    .join('; ');
   if (note !== '') reading.note = note;
 
   return reading;
@@ -1045,12 +1278,34 @@ export const claudeCodeAdapter: QuotaAdapter = {
     const now = ctx.now();
     const nowMs = now.getTime();
 
-    // Weekly is a calendar quantity, so the clock still decides it.
-    const weekly = windowBounds('weekly', now, { weekStartsOn: opts.weekStartsOn });
+    // Anthropic's own figures, when the status line recorder has any. Read
+    // BEFORE the scan: a reported window brings its own bounds, and the scan
+    // has to cover those bounds for the tokens and cost beside it to be right.
+    const snapshot = await readRateLimitSnapshot(statusLineSnapshotPath(ctx.homeDir));
+    const reportedSession = liveReported(snapshot, 'five_hour', nowMs);
+    const reportedWeekly = liveReported(snapshot, 'seven_day', nowMs);
+    const reportedSessionRange =
+      reportedSession === null ? null : reportedRange(reportedSession, 'five_hour');
+
+    ctx.debug(
+      snapshot === null
+        ? `${PROVIDER_ID}: no status line snapshot, so every percentage is derived`
+        : `${PROVIDER_ID}: status line snapshot last written ${snapshot.writtenAt.toISOString()}; ` +
+            `5-hour ${reportedSession === null ? 'not live' : 'reported'}, ` +
+            `7-day ${reportedWeekly === null ? 'not live' : 'reported'}`,
+    );
+
+    // Weekly is a calendar quantity, so the clock decides it - unless Anthropic
+    // reported the window, and then its bounds are the only honest ones.
+    const weekly =
+      reportedWeekly === null
+        ? windowBounds('weekly', now, { weekStartsOn: opts.weekStartsOn })
+        : reportedRange(reportedWeekly, 'seven_day');
 
     // Session is not. Its bounds come out of the events, below, so only the
     // weekly accumulator can be filled while streaming.
-    const streamed: WindowAccumulator[] = [makeAccumulator('weekly', weekly, opts.weekly)];
+    const weeklyAcc = makeAccumulator('weekly', weekly, opts.weekly);
+    const streamed: WindowAccumulator[] = [weeklyAcc];
 
     const sessionMs = Math.round(opts.sessionHours * MS_PER_HOUR);
     const ladder = anchorLadderMs(sessionMs);
@@ -1106,7 +1361,13 @@ export const claudeCodeAdapter: QuotaAdapter = {
      * five hours of events.
      */
     const sessionCandidates: UsageEvent[] = [];
-    const liveFloorMs = nowMs - sessionMs;
+    // A reported five-hour window opens up to five hours before `now`, which
+    // is earlier than `now - sessionMs` whenever `sessionHours` is configured
+    // shorter than that, and every call inside it belongs in its cost.
+    const liveFloorMs = Math.min(
+      nowMs - sessionMs,
+      reportedSessionRange === null ? Infinity : reportedSessionRange.start.getTime(),
+    );
 
     /*
      * Every pass keeps events back to the CEILING of the ladder, not back to
@@ -1164,7 +1425,9 @@ export const claudeCodeAdapter: QuotaAdapter = {
     /** Extra transcripts the step that hit the file ceiling wanted to open. */
     let overBudget: number | null = null;
 
-    if (gap === null && anchorFloorMs < knownFromMs) {
+    // A window Anthropic reported has no anchor to prove, so a refresh that has
+    // one opens no transcript purely to search for it.
+    if (reportedSession === null && gap === null && anchorFloorMs < knownFromMs) {
       // One directory walk and one stat pass serves every rung, and each rung
       // takes the slice it needs from it, so no transcript is ever listed,
       // stat-ed or opened twice however far the search widens.
@@ -1244,9 +1507,10 @@ export const claudeCodeAdapter: QuotaAdapter = {
     );
     const sessionAcc = makeAccumulator(
       'session',
-      sessionWindow.live
-        ? { start: sessionWindow.start, end: sessionWindow.end }
-        : { start: null, end: null },
+      reportedSessionRange ??
+        (sessionWindow.live
+          ? { start: sessionWindow.start, end: sessionWindow.end }
+          : { start: null, end: null }),
       opts.session,
     );
     foldEvents(sessionAcc, sessionCandidates);
@@ -1290,18 +1554,27 @@ export const claudeCodeAdapter: QuotaAdapter = {
       doubts,
     };
 
-    ctx.debug(
-      sessionWindow.live
-        ? `${PROVIDER_ID}: session window anchored to activity at ` +
-            `${sessionWindow.start.toISOString()}, resets ${sessionWindow.end.toISOString()}` +
-            `${doubts.length > 0 ? ' (anchor uncertain)' : ''}`
-        : `${PROVIDER_ID}: no session window is open (${sessionWindow.reason})`,
-    );
+    if (reportedSession === null) {
+      ctx.debug(
+        sessionWindow.live
+          ? `${PROVIDER_ID}: session window anchored to activity at ` +
+              `${sessionWindow.start.toISOString()}, resets ${sessionWindow.end.toISOString()}` +
+              `${doubts.length > 0 ? ' (anchor uncertain)' : ''}`
+          : `${PROVIDER_ID}: no session window is open (${sessionWindow.reason})`,
+      );
+    }
 
-    return [
-      buildReading(sessionAcc, opts, scan, anchor),
-      ...streamed.map((acc) => buildReading(acc, opts, scan)),
-    ];
+    const sessionReading =
+      reportedSession === null
+        ? buildReading(sessionAcc, opts, scan, anchor, statusLineNotePart(snapshot, 'five_hour', nowMs))
+        : buildReportedReading(sessionAcc, reportedSession, 'five_hour', opts, scan, anchorStamps, nowMs);
+
+    const weeklyReading =
+      reportedWeekly === null
+        ? buildReading(weeklyAcc, opts, scan, null, statusLineNotePart(snapshot, 'seven_day', nowMs))
+        : buildReportedReading(weeklyAcc, reportedWeekly, 'seven_day', opts, scan, anchorStamps, nowMs);
+
+    return [sessionReading, weeklyReading];
   },
 };
 

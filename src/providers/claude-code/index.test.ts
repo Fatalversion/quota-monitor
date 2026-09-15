@@ -10,10 +10,14 @@ import { MemorySecretStore } from '../../core/secrets.js';
 import {
   MAX_ANCHOR_WIDENING_FILES,
   MAX_TRANSCRIPT_FILES,
+  PERCENT_LIMIT,
   PROVIDER_ID,
   claudeCodeAdapter,
 } from './index.js';
+import { statusLineSnapshotPath, writeRateLimitSnapshot } from './statusline.js';
 import { MAX_LINE_LENGTH } from './transcripts.js';
+
+import type { RateLimitSnapshot } from './statusline.js';
 
 /**
  * A seam for the one failure that cannot be produced from the filesystem in a
@@ -1373,6 +1377,236 @@ describe('the widening search for the session anchor', () => {
     expect(session.resetsAt).toBe('2026-09-11T13:10:00.000Z');
     expect(session.note ?? '').not.toContain('ANCHOR UNCERTAIN');
     expect(debug.some((line) => line.includes('anchor uncertain'))).toBe(false);
+    expect(widenings(debug)).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Anthropic's own figure, via the status line snapshot                       */
+/* -------------------------------------------------------------------------- */
+
+/** A home directory of its own, so a snapshot written here reaches only this test. */
+async function makeHome(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'quota-monitor-cc-home-'));
+  created.push(dir);
+  return dir;
+}
+
+function snapshotHarness(
+  claudeDir: string,
+  home: string,
+  options: Record<string, unknown> = {},
+  now: Date = NOW,
+): Harness {
+  const base = harness(claudeDir, options, now);
+  return { debug: base.debug, ctx: { ...base.ctx, homeDir: home } };
+}
+
+function reported(usedPercentage: number, resetsAt: string, observedAt: string) {
+  return {
+    usedPercentage,
+    resetsAt: new Date(resetsAt),
+    observedAt: new Date(observedAt),
+    clamped: false,
+  };
+}
+
+async function writeSnapshot(home: string, windows: RateLimitSnapshot['windows']): Promise<void> {
+  await writeRateLimitSnapshot(statusLineSnapshotPath(home), { writtenAt: NOW, windows });
+}
+
+describe('reported figures from the status line snapshot', () => {
+  it("reports Anthropic's own percentages, reset times and window bounds", async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000, output: 500 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(18, '2026-09-11T06:00:00.000Z', '2026-09-11T02:30:00.000Z'),
+      seven_day: reported(39.5, '2026-09-15T12:00:00.000Z', '2026-09-11T02:30:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x' });
+    const readings = await claudeCodeAdapter.read(ctx);
+    expect(readings.map((r) => r.window)).toEqual(['session', 'weekly']);
+
+    const session = byWindow(readings, 'session');
+    expect(session).toMatchObject({
+      provider: 'claude-code',
+      label: 'Max 20x',
+      confidence: 'reported',
+      unit: 'percent',
+      used: 18,
+      limit: PERCENT_LIMIT,
+      resetsAt: '2026-09-11T06:00:00.000Z',
+      windowStart: '2026-09-11T01:00:00.000Z',
+    });
+    expect(percentUsed(session)).toBe(18);
+    expect(session.estimatedCostUsd).toBeGreaterThan(0);
+    expect(session.note).toContain("Anthropic's own figure");
+    expect(session.note).toContain('no Claude Code call has been recorded on this machine since');
+
+    const weekly = byWindow(readings, 'weekly');
+    expect(weekly).toMatchObject({
+      confidence: 'reported',
+      unit: 'percent',
+      used: 39.5,
+      resetsAt: '2026-09-15T12:00:00.000Z',
+      windowStart: '2026-09-08T12:00:00.000Z',
+    });
+  });
+
+  it("counts tokens and cost over Anthropic's five hours, not over the estimated window", async () => {
+    // The estimate anchors on the 00:30 call and opens [00:30, 05:30). Anthropic
+    // says the window resets at 06:00, so it opened at 01:00 and the 00:30 call
+    // belongs to the window before it.
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T00:30:00.000Z', 'claude-opus-5', { input: 100_000 }),
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000 }),
+    ]);
+
+    const estimate = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, await makeHome()).ctx),
+      'session',
+    );
+    expect(estimate.used).toBe(101_000);
+
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(12, '2026-09-11T06:00:00.000Z', '2026-09-11T02:59:00.000Z'),
+    });
+    const session = byWindow(await claudeCodeAdapter.read(snapshotHarness(dir, home).ctx), 'session');
+
+    expect(session.confidence).toBe('reported');
+    expect(session.note).toContain('covers 1 call inside this same window');
+    expect(session.estimatedCostUsd ?? 0).toBeLessThan(estimate.estimatedCostUsd ?? 0);
+  });
+
+  it("uses Anthropic's seven-day bounds even when they open before the calendar week", async () => {
+    // Monday 2026-09-07 opens the calendar week. Anthropic's window resets on
+    // Saturday at 18:00, so it opened the previous Saturday - and the Sunday
+    // call below is inside it.
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-06T12:00:00.000Z', 'claude-opus-5', { input: 400 }),
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000 }),
+    ]);
+
+    const calendar = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, await makeHome()).ctx),
+      'weekly',
+    );
+    expect(calendar.used).toBe(1000);
+
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(41, '2026-09-12T18:00:00.000Z', '2026-09-11T02:59:00.000Z'),
+    });
+    const weekly = byWindow(await claudeCodeAdapter.read(snapshotHarness(dir, home).ctx), 'weekly');
+
+    expect(weekly.windowStart).toBe('2026-09-05T18:00:00.000Z');
+    expect(weekly.note).toContain('covers 2 calls inside this same window');
+  });
+
+  it('says how far behind the figure is when calls came after it', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 10 }),
+      assistantLine('2026-09-11T02:10:00.000Z', 'claude-opus-5', { input: 10 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(30, '2026-09-11T06:00:00.000Z', '2026-09-11T01:30:00.000Z'),
+    });
+
+    const session = byWindow(await claudeCodeAdapter.read(snapshotHarness(dir, home).ctx), 'session');
+
+    expect(session.confidence).toBe('reported');
+    expect(session.note).toContain('BEHIND');
+    expect(session.note).toContain('1h 30m ago');
+    expect(session.note).toContain('2 Claude Code calls recorded on this machine since then are not in it');
+  });
+
+  it('does not count a call recorded moments before the status line ran as one it missed', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T02:00:30.000Z', 'claude-opus-5', { input: 10 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(30, '2026-09-11T06:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const session = byWindow(await claudeCodeAdapter.read(snapshotHarness(dir, home).ctx), 'session');
+    expect(session.note).not.toContain('BEHIND');
+  });
+
+  it("falls back to the estimate once Anthropic's window has reset, and says so", async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000, output: 500 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(97, '2026-09-11T02:30:00.000Z', '2026-09-11T01:00:00.000Z'),
+    });
+
+    const readings = await claudeCodeAdapter.read(snapshotHarness(dir, home).ctx);
+    const session = byWindow(readings, 'session');
+    const weekly = byWindow(readings, 'weekly');
+
+    expect(session.confidence).toBe('derived');
+    expect(session.unit).toBe('tokens');
+    expect(session.note).toContain("Anthropic's last reported 5-hour figure, 97%");
+    expect(session.note).toContain('ended at 2026-09-11T02:30:00.000Z');
+    expect(weekly.confidence).toBe('derived');
+    expect(weekly.note).toContain('has not seen a 7-day figure yet');
+  });
+
+  it('points at the status line setup when there is no snapshot at all', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1 }),
+    ]);
+
+    const { ctx, debug } = snapshotHarness(dir, await makeHome());
+    const readings = await claudeCodeAdapter.read(ctx);
+
+    expect(readings.every((r) => r.confidence === 'derived')).toBe(true);
+    expect(byWindow(readings, 'session').note).toContain('quota statusline --print-config');
+    expect(debug).toContain('claude-code: no status line snapshot, so every percentage is derived');
+  });
+
+  it('treats a snapshot it cannot read as no snapshot', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {});
+    await writeFile(statusLineSnapshotPath(home), '{"kind": "claude-code-rate-limits", ', 'utf8');
+
+    const readings = await claudeCodeAdapter.read(snapshotHarness(dir, home).ctx);
+    expect(readings.every((r) => r.confidence === 'derived')).toBe(true);
+  });
+
+  it('skips the anchor search for a five-hour window Anthropic reported', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(5, '2026-09-11T06:00:00.000Z', '2026-09-11T02:59:00.000Z'),
+    });
+
+    const { ctx, debug } = snapshotHarness(dir, home);
+    await claudeCodeAdapter.read(ctx);
+
+    expect(debug.some((line) => line.includes('5-hour reported'))).toBe(true);
+    expect(debug.some((line) => line.includes('anchored to activity'))).toBe(false);
     expect(widenings(debug)).toEqual([]);
   });
 });
