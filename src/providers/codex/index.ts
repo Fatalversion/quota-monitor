@@ -481,6 +481,9 @@ function buildReading(
     unit: 'percent',
     windowStart: windowStartOf(rate),
     resetsAt: rate.resetsAt.toISOString(),
+    // The instant Codex wrote it, which is what makes "NOT LIVE" in the note
+    // below visible on the widget as well as in the CLI.
+    observedAt: snapshot.at.toISOString(),
     // Not negotiable, and the mirror image of the Claude Code adapter: this
     // figure was published by the provider, so it must never render with the
     // '~' that marks an estimate of ours.

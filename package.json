@@ -1,6 +1,6 @@
 {
   "name": "quota-monitor",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "One widget for every AI subscription you are burning through.",
   "license": "MIT",
   "type": "module",

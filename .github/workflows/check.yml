@@ -1,0 +1,59 @@
+# Type-check and test, on both platforms that matter.
+#
+# WHY WINDOWS IS NOT OPTIONAL: this is a Windows-first widget. Almost everything
+# that has broken here is platform-shaped - path separators in agent-facing
+# text, `.cmd` shims that node refuses to spawn, `%LOCALAPPDATA%` resolved
+# through a known-folder API rather than an environment variable. A green Linux
+# run says nothing about any of it.
+#
+# WHY IT IS STILL CHEAP: no Rust, no packaging. Compiling the Tauri shell takes
+# minutes and pulls a toolchain; `tsc` and the test suite take seconds, and they
+# are what catches the regressions that actually happen. The installer is built
+# deliberately, by a person, and belongs in a release workflow rather than here.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a run can be started by hand without pushing anything.
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run pointless. Cancel it
+# rather than paying for an answer about code nobody has any more.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      # One platform failing is a result, not a reason to stop hearing from the
+      # other - and "Windows only" versus "both" is the first thing to know.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # The version the sidecar build targets; see scripts/lib/toolchain.mjs.
+          node-version: '22'
+          cache: npm
+
+      # `ci`, not `install`: the lockfile decides, and a run that quietly
+      # resolved different dependencies would be testing something else.
+      - run: npm ci
+
+      - name: Type-check
+        run: npm run build
+
+      - name: Test
+        run: npm test
