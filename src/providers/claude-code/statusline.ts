@@ -104,6 +104,17 @@ export interface ObservedWindow {
 
 export type ObservedLimits = { [W in LimitWindow]?: ObservedWindow };
 
+/** Percentage points per token, and the observation it came from. */
+export interface MeasuredRate {
+  pointsPerToken: number;
+  /** Points the provider added across the interval. */
+  points: number;
+  /** Local tokens recorded in the same interval. */
+  tokens: number;
+  /** The later of the two figures it was measured between. */
+  measuredAt: Date;
+}
+
 /** A figure this window used to carry, and when it did. */
 export interface Observation {
   usedPercentage: number;
@@ -146,6 +157,17 @@ export interface RateLimitSnapshot {
   /** When the file was last written, which is when any window last changed. */
   writtenAt: Date;
   windows: { [W in LimitWindow]?: SnapshotWindow };
+  /**
+   * What one of this user's tokens costs against each window, in percentage
+   * points, as last measured between two reported figures.
+   *
+   * Kept because the thing it is measured from does not survive: `history` is
+   * cleared when a window resets, and a window that has just reset is exactly
+   * when the estimate has to stand on its own. A rate measured yesterday is a
+   * far better denominator than a constant solved months ago on someone else's
+   * model mix - on this machine the two differed by 4.5x inside one week.
+   */
+  rates?: { [W in LimitWindow]?: MeasuredRate };
   /**
    * Per-model weekly limits, keyed by the name the provider printed.
    *
@@ -326,7 +348,37 @@ export function mergeSnapshot(
   }
 
   const writtenAt = changed || existing === null ? now : existing.writtenAt;
-  return { snapshot: { writtenAt, windows, models: trimmed }, changed };
+  const rates = existing?.rates;
+  return {
+    snapshot: { writtenAt, windows, models: trimmed, ...(rates === undefined ? {} : { rates }) },
+    changed,
+  };
+}
+
+/**
+ * Record a freshly measured rate for one window.
+ *
+ * Separate from `mergeSnapshot` because it is a different kind of fact: the
+ * windows carry what the provider SAID, and this carries what we worked out
+ * from two of those sayings. `changed` is false when the rate is the same one
+ * already on disk, so a read that measures nothing new writes nothing.
+ */
+export function withRate(
+  snapshot: RateLimitSnapshot,
+  window: LimitWindow,
+  rate: MeasuredRate | null,
+): { snapshot: RateLimitSnapshot; changed: boolean } {
+  if (rate === null) return { snapshot, changed: false };
+
+  const kept = snapshot.rates?.[window];
+  if (kept !== undefined && kept.measuredAt.getTime() >= rate.measuredAt.getTime()) {
+    return { snapshot, changed: false };
+  }
+
+  return {
+    snapshot: { ...snapshot, rates: { ...snapshot.rates, [window]: rate } },
+    changed: true,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -374,12 +426,25 @@ export function serializeSnapshot(snapshot: RateLimitSnapshot): string {
     };
   }
 
+  const rates: Record<string, unknown> = {};
+  for (const window of LIMIT_WINDOWS) {
+    const rate = snapshot.rates?.[window];
+    if (rate === undefined) continue;
+    rates[window] = {
+      pointsPerToken: rate.pointsPerToken,
+      points: rate.points,
+      tokens: rate.tokens,
+      measuredAt: rate.measuredAt.toISOString(),
+    };
+  }
+
   const payload = {
     tool: 'quota-monitor',
     kind: SNAPSHOT_KIND,
     version: SNAPSHOT_VERSION,
     writtenAt: snapshot.writtenAt.toISOString(),
     windows,
+    ...(Object.keys(rates).length > 0 ? { rates } : {}),
     // Omitted while empty, so a file from before per-model limits and a file
     // from a plan that has none look the same.
     ...(Object.keys(models).length > 0 ? { models } : {}),
@@ -420,6 +485,20 @@ export function parseSnapshot(text: string): RateLimitSnapshot | null {
     if (entry !== null) windows[window] = entry;
   }
 
+  const rates: { [W in LimitWindow]?: MeasuredRate } = {};
+  const rawRates = field(parsed, 'rates');
+  for (const window of LIMIT_WINDOWS) {
+    const entry = field(rawRates, window);
+    const pointsPerToken = field(entry, 'pointsPerToken');
+    const points = field(entry, 'points');
+    const tokens = field(entry, 'tokens');
+    const measuredAt = isoDate(field(entry, 'measuredAt'));
+    if (typeof pointsPerToken !== 'number' || !Number.isFinite(pointsPerToken)) continue;
+    if (!(pointsPerToken > 0) || measuredAt === null) continue;
+    if (typeof points !== 'number' || typeof tokens !== 'number') continue;
+    rates[window] = { pointsPerToken, points, tokens, measuredAt };
+  }
+
   const models: Record<string, SnapshotWindow> = {};
   const rawModels = field(parsed, 'models');
   if (typeof rawModels === 'object' && rawModels !== null && !Array.isArray(rawModels)) {
@@ -434,7 +513,7 @@ export function parseSnapshot(text: string): RateLimitSnapshot | null {
     }
   }
 
-  return { writtenAt, windows, models };
+  return { writtenAt, windows, models, ...(Object.keys(rates).length > 0 ? { rates } : {}) };
 }
 
 /** One stored window, or null when the file's version of it is not usable. */

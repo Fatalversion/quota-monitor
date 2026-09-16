@@ -20,6 +20,7 @@ import {
   recordStatusLine,
   serializeSnapshot,
   statusLineSnapshotPath,
+  withRate,
   writeRateLimitSnapshot,
 } from './statusline.js';
 
@@ -617,5 +618,62 @@ describe('per-model weekly limits', () => {
     const text = serializeSnapshot(empty);
     expect(text).not.toContain('models');
     expect(parseSnapshot(text)?.models).toEqual({});
+  });
+});
+
+describe('the measured rate, kept for later windows', () => {
+  const rate = (pointsPerToken: number, measuredAt: Date) => ({
+    pointsPerToken,
+    points: 10,
+    tokens: 10 / pointsPerToken,
+    measuredAt,
+  });
+
+  const base: RateLimitSnapshot = { writtenAt: NOW, windows: {}, models: {} };
+
+  it('stores one and reads it back', () => {
+    const { snapshot, changed } = withRate(base, 'seven_day', rate(0.00003, NOW));
+    expect(changed).toBe(true);
+
+    const back = parseSnapshot(serializeSnapshot(snapshot));
+    expect(back?.rates?.seven_day?.pointsPerToken).toBeCloseTo(0.00003, 10);
+    expect(back?.rates?.seven_day?.measuredAt).toEqual(NOW);
+  });
+
+  it('keeps the later measurement and ignores an older one', () => {
+    const first = withRate(base, 'seven_day', rate(0.00003, LATER)).snapshot;
+    const older = withRate(first, 'seven_day', rate(0.00009, NOW));
+
+    expect(older.changed).toBe(false);
+    expect(older.snapshot.rates?.seven_day?.pointsPerToken).toBeCloseTo(0.00003, 10);
+
+    const newer = withRate(first, 'seven_day', rate(0.00009, new Date(LATER.getTime() + 1)));
+    expect(newer.changed).toBe(true);
+    expect(newer.snapshot.rates?.seven_day?.pointsPerToken).toBeCloseTo(0.00009, 10);
+  });
+
+  it('survives a window reset, which is the whole reason it is stored', () => {
+    // A new window clears history, so the evidence the rate was measured from
+    // is gone - but the rate itself has to outlive it.
+    const withMeasurement = withRate(base, 'five_hour', rate(0.0002, NOW)).snapshot;
+    const afterReset = mergeSnapshot(
+      withMeasurement,
+      parseStatusLinePayload(payload({ five_hour: window(3, 5 * HOUR) }), LATER),
+      LATER,
+    ).snapshot;
+
+    expect(afterReset.windows.five_hour?.history).toEqual([]);
+    expect(afterReset.rates?.five_hour?.pointsPerToken).toBeCloseTo(0.0002, 10);
+  });
+
+  it('refuses a rate that is not a positive number', () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const snapshot = { ...base, rates: { seven_day: rate(bad, NOW) } };
+      expect(parseSnapshot(serializeSnapshot(snapshot))?.rates?.seven_day).toBeUndefined();
+    }
+  });
+
+  it('writes no rates key while none has been measured', () => {
+    expect(serializeSnapshot(base)).not.toContain('rates');
   });
 });

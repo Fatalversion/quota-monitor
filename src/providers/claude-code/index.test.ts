@@ -15,7 +15,11 @@ import {
   claudeCodeAdapter,
 } from './index.js';
 import { scanCachePath } from './scanCache.js';
-import { statusLineSnapshotPath, writeRateLimitSnapshot } from './statusline.js';
+import {
+  readRateLimitSnapshot,
+  statusLineSnapshotPath,
+  writeRateLimitSnapshot,
+} from './statusline.js';
 import { MAX_LINE_LENGTH } from './transcripts.js';
 
 import type { RateLimitSnapshot } from './statusline.js';
@@ -2019,5 +2023,99 @@ describe('reading a transcript only once', () => {
       'session',
     );
     expect(after.used).toBe(1234);
+  });
+});
+
+describe('the denominator an estimate divides by', () => {
+  /** A snapshot carrying a measured rate and nothing else. */
+  async function withStoredRate(home: string, pointsPerToken: number): Promise<void> {
+    await writeRateLimitSnapshot(statusLineSnapshotPath(home), {
+      writtenAt: NOW,
+      windows: {},
+      models: {},
+      rates: {
+        five_hour: { pointsPerToken, points: 10, tokens: 10 / pointsPerToken, measuredAt: NOW },
+      },
+    });
+  }
+
+  it('prefers a measured rate to the plan table', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    // One point per 1,000 tokens: a hundred points is 100,000 tokens.
+    await withStoredRate(home, 0.001);
+
+    const session = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx),
+      'session',
+    );
+
+    expect(session.limit).toBe(100_000);
+    expect(percentUsed(session)).toBe(50);
+    expect(session.confidence).toBe('derived');
+    expect(session.note).toContain('MEASURED from');
+  });
+
+  it('never overrides a cap you configured', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await withStoredRate(home, 0.001);
+
+    const session = byWindow(
+      await claudeCodeAdapter.read(
+        snapshotHarness(dir, home, { plan: 'max-20x', sessionLimit: 400_000 }).ctx,
+      ),
+      'session',
+    );
+
+    // Someone who typed a number meant it.
+    expect(session.limit).toBe(400_000);
+    expect(session.note).toContain('came from your config');
+  });
+
+  it('says there is no cap at all when nothing has been measured', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000 }),
+    ]);
+
+    const session = byWindow(
+      await claudeCodeAdapter.read(
+        snapshotHarness(dir, await makeHome(), { plan: 'max-20x' }).ctx,
+      ),
+      'session',
+    );
+
+    // The plan table deliberately holds no token caps: see plans.ts on why a
+    // wrong percentage is worse than none.
+    expect(session.note).toContain('no cap known');
+  });
+
+  it('measures a rate from two reported figures and stores it', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      // 100K tokens between the two figures bought 10 points.
+      assistantLine('2026-09-11T00:30:00.000Z', 'claude-opus-5', { input: 100_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(50, '2026-09-11T06:00:00.000Z', '2026-09-11T01:00:00.000Z', [
+        { usedPercentage: 40, observedAt: '2026-09-11T00:00:00.000Z' },
+      ]),
+    });
+
+    await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx);
+
+    const stored = await readRateLimitSnapshot(statusLineSnapshotPath(home));
+    expect(stored?.rates?.five_hour?.pointsPerToken).toBeCloseTo(10 / 100_000, 10);
+    // Which is a cap of a million tokens, and that is what a later estimate
+    // divides by once this window has reset.
+    expect(PERCENT_LIMIT / (stored?.rates?.five_hour?.pointsPerToken ?? 1)).toBeCloseTo(1_000_000, 3);
   });
 });

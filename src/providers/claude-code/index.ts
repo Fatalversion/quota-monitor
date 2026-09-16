@@ -96,10 +96,13 @@ import { UNDETECTED, detectPlan } from './detect-plan.js';
 import { parseLine, usageEventKey } from './parse.js';
 import { planFor } from './plans.js';
 import {
+  type MeasuredRate,
   LIMIT_WINDOW_MS,
   formatPercent,
   readRateLimitSnapshot,
   statusLineSnapshotPath,
+  withRate,
+  writeRateLimitSnapshot,
 } from './statusline.js';
 import {
   MAX_LINE_LENGTH,
@@ -286,7 +289,7 @@ export interface ClaudeCodeOptions {
 }
 
 /** Where a printed denominator actually came from. */
-type LimitSource = 'config' | 'plan-table' | 'none';
+type LimitSource = 'config' | 'measured' | 'plan-table' | 'none';
 
 interface ResolvedLimit {
   value: number | null;
@@ -1024,6 +1027,16 @@ function buildNote(
         `limit ${group(acc.limit.value ?? 0)} tokens came from your config (${configKey})`,
       );
       break;
+    case 'measured':
+      parts.push(
+        `limit ${group(acc.limit.value ?? 0)} tokens was MEASURED from Anthropic's own figures ` +
+          `on this machine, not taken from the plan table: two reported percentages and the ` +
+          `tokens recorded between them say what your tokens cost against this window, and ` +
+          `${configKey} would override it. It follows your mix of models, which a constant ` +
+          `cannot - on the machine this was written for, a week of mixed models and a day of ` +
+          `1M-context Opus differed by 4.5x`,
+      );
+      break;
     case 'plan-table':
       parts.push(
         `limit ${group(acc.limit.value ?? 0)} tokens is a COMMUNITY ESTIMATE for ` +
@@ -1489,6 +1502,29 @@ function buildReportedReading(
   if (totals.costUsd !== null) reading.estimatedCostUsd = totals.costUsd;
   reading.note = buildReportedNote(acc, totals, entry, window, opts, scan, stamps, nowMs, topUp);
   return reading;
+}
+
+/**
+ * The cap a measured rate implies, in tokens.
+ *
+ * The rate says what one token costs in percentage points; a hundred points is
+ * therefore `100 / rate` tokens, which is the same quantity `sessionLimit` and
+ * `weeklyLimit` are configured with. Expressing it that way rather than
+ * switching the row to percentages keeps every reading the same shape, keeps
+ * "183.3K/5.5M tok" on screen, and means only the NOTE has to explain where
+ * the denominator came from.
+ *
+ * A configured cap always wins: someone who typed a number meant it. A
+ * measured one beats the plan table, which is a community estimate for a plan
+ * rather than a measurement of this account.
+ */
+function withMeasuredLimit(limit: ResolvedLimit, rate: MeasuredRate | undefined): ResolvedLimit {
+  if (rate === undefined || !(rate.pointsPerToken > 0)) return limit;
+  if (limit.source === 'config') return limit;
+
+  const implied = Math.round(PERCENT_LIMIT / rate.pointsPerToken);
+  if (!Number.isFinite(implied) || implied <= 0) return limit;
+  return { value: implied, source: 'measured', key: limit.key };
 }
 
 function buildReading(
@@ -1992,6 +2028,56 @@ export const claudeCodeAdapter: QuotaAdapter = {
           : `${PROVIDER_ID}: no session window is open (${sessionWindow.reason})`,
       );
     }
+
+    /*
+     * What this read measured, kept for the reads that come after it.
+     *
+     * A different kind of fact from the windows themselves: those carry what
+     * Anthropic SAID, this carries what two of those sayings and the
+     * transcripts between them imply one of this user's tokens costs. It is
+     * stored because the evidence does not survive - `history` is cleared when
+     * a window resets, and a window that has just reset is exactly when the
+     * estimate has to stand on its own.
+     */
+    let store = snapshot;
+    if (store !== null) {
+      let rateChanged = false;
+      const measurements = [
+        ['five_hour', calibrationFrom(sessionSpan, sessionBetween, opts), reportedSession],
+        ['seven_day', calibrationFrom(weeklySpan, weeklyBetween, opts), reportedWeekly],
+      ] as const;
+
+      for (const [window, measured, entry] of measurements) {
+        if (measured === null || entry === null || store === null) continue;
+        const next = withRate(store, window, {
+          pointsPerToken: measured.pointsPerToken,
+          points: measured.points,
+          tokens: measured.tokens,
+          measuredAt: entry.observedAt,
+        });
+        store = next.snapshot;
+        rateChanged = rateChanged || next.changed;
+      }
+
+      if (rateChanged && store !== null) {
+        try {
+          await writeRateLimitSnapshot(statusLineSnapshotPath(ctx.homeDir), store);
+          ctx.debug(`${PROVIDER_ID}: measured rate stored for the windows that come after this one`);
+        } catch (error) {
+          // Never fail a read over a cache of our own arithmetic.
+          ctx.debug(
+            `${PROVIDER_ID}: could not store the measured rate (${messageOf(error)}); ` +
+              `the estimate falls back to the cap`,
+          );
+        }
+      }
+    }
+
+    // The denominator, in order of authority: a cap you configured, then one
+    // measured from Anthropic's own figures (including the one measured a
+    // moment ago, above), then the plan table's community estimate.
+    sessionAcc.limit = withMeasuredLimit(sessionAcc.limit, store?.rates?.five_hour);
+    weeklyAcc.limit = withMeasuredLimit(weeklyAcc.limit, store?.rates?.seven_day);
 
     const sessionReading =
       reportedSession === null

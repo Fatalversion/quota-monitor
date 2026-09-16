@@ -102,8 +102,14 @@ export const PLANS: Record<PlanId, PlanCaps> = Object.freeze({
   // Two routes out, neither of which is guessing:
   //   1. Config. Watch for the window where Claude Code actually refuses,
   //      read the token total off `quota --json`, set sessionLimit/weeklyLimit.
-  //   2. Calibration, not yet built. Record the high-water mark at the moment
-  //      a refusal is observed and learn the ceiling from the account itself.
+  //   2. Calibration, which is now built and is the usual answer. A status
+  //      line or a /usage probe reports two percentages; the transcripts say
+  //      what was spent between them; the quotient is what a token costs
+  //      against that window for THIS account and THIS mix of models. The
+  //      implied cap is stored in the rate-limit snapshot and used as the
+  //      denominator whenever config has not pinned one - so these nulls are
+  //      the first run, not the permanent state. See withMeasuredLimit and
+  //      topUpFor in index.ts.
   //
   // Compare the Codex adapter, which needs none of this: OpenAI writes the
   // real used_percent to disk, so those readings are `reported`, not derived.
