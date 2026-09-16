@@ -1114,6 +1114,7 @@ function buildReportedNote(
   scan: ScanSummary,
   stamps: readonly number[],
   nowMs: number,
+  topUp: TopUp | null,
 ): string {
   const parts: string[] = [];
   const label = LIMIT_LABEL[window];
@@ -1132,16 +1133,40 @@ function buildReportedNote(
   // The figure cannot include a call made after it was recorded, and those
   // calls are sitting in the transcripts. Counting them turns "this might be
   // stale" into a statement of how stale.
-  parts.push(
-    since > 0
-      ? `BEHIND: the figure last changed ${age}, and ${group(since)} Claude Code ` +
-          `${plural(since, 'call')} recorded on this machine since then ${plural(since, 'is', 'are')} ` +
-          `not in it, so the real figure is higher - it catches up the next time a session ` +
-          `with the status line gets a response`
-      : `the figure last changed ${age} and no Claude Code call has been recorded on this ` +
-          `machine since; usage on the same plan elsewhere (claude.ai, the desktop app, ` +
-          `another machine) still counts against it and cannot show here`,
-  );
+  const capFrom =
+    topUp === null || topUp.limit.source === 'config'
+      ? `your config (providers.${PROVIDER_ID}.${acc.limit.key})`
+      : `the COMMUNITY ESTIMATE for "${opts.plan.label}" in src/providers/${PROVIDER_ID}/plans.ts`;
+
+  if (topUp !== null) {
+    // The shown figure is two numbers with different pedigrees, and a reader
+    // has to be able to take them apart.
+    parts.push(
+      `TOPPED UP: the figure last changed ${age} and cannot include what came after it, so ` +
+        `this row adds an estimate of ${formatPercent(topUp.points)} for the ` +
+        `${group(topUp.calls)} Claude Code ${plural(topUp.calls, 'call')} recorded on this ` +
+        `machine since - ${compact(topUp.tokens)} tokens against the ${compact(topUp.limit.value ?? 0)}-token ` +
+        `cap from ${capFrom}; the anchor is ` +
+        `Anthropic's and the addition is ours, which is why the whole figure is marked as an ` +
+        `estimate, and it snaps back to their number the next time a session with the status ` +
+        `line gets a response`,
+    );
+  } else if (since > 0) {
+    // Calls after the figure, but no cap to price them against.
+    parts.push(
+      `BEHIND: the figure last changed ${age}, and ${group(since)} Claude Code ` +
+        `${plural(since, 'call')} recorded on this machine since then ${plural(since, 'is', 'are')} ` +
+        `not in it, so the real figure is higher - set providers.${PROVIDER_ID}.${acc.limit.key} ` +
+        `to have those calls estimated into this row, or it catches up the next time a session ` +
+        `with the status line gets a response`,
+    );
+  } else {
+    parts.push(
+      `the figure last changed ${age} and no Claude Code call has been recorded on this ` +
+        `machine since; usage on the same plan elsewhere (claude.ai, the desktop app, ` +
+        `another machine) still counts against it and cannot show here`,
+    );
+  }
 
   if (entry.clamped) {
     parts.push(`Claude Code sent a used_percentage outside 0-100, shown clamped to ${pct}`);
@@ -1168,6 +1193,59 @@ function buildReportedNote(
   return parts.join('; ');
 }
 
+/**
+ * What local usage adds to a reported figure that has gone stale.
+ *
+ * Anthropic's percentage is a photograph, not a feed: it is only refreshed when
+ * a Claude Code session with a status line gets a response, and status lines
+ * are a terminal feature - an IDE, print-mode or headless session never fires
+ * one (code.claude.com/docs/en/statusline, checked 2026-09-16). Someone working
+ * in the IDE therefore burns real quota against a bar that does not move, which
+ * is the exact failure this exists to stop.
+ *
+ * Every one of those calls IS on disk, in the transcripts this adapter already
+ * streams, so the arithmetic is the same one the derived rows do: tokens over
+ * the window's cap. The reported figure stays the anchor and only usage recorded
+ * AFTER it is added, so nothing is double-counted and the estimate collapses
+ * back to Anthropic's own number the moment a status line speaks again.
+ */
+interface TopUp {
+  /** Percentage points to add to the reported figure. */
+  points: number;
+  /** Tokens behind those points, counted the way the derived rows count. */
+  tokens: number;
+  /** Calls those tokens came from. */
+  calls: number;
+  /** The cap they were divided by, and where it came from. */
+  limit: ResolvedLimit;
+}
+
+/**
+ * The top-up, or null when there is nothing honest to add.
+ *
+ * Null in three cases, each of which leaves the reading as Anthropic stated it:
+ * nothing was recorded after the figure; the plan has no token cap for this
+ * window, so there is no denominator; or the cap is not a positive number.
+ */
+function topUpFor(
+  since: WindowAccumulator | null,
+  limit: ResolvedLimit,
+  opts: ResolvedOptions,
+): TopUp | null {
+  if (since === null || since.calls === 0) return null;
+  if (limit.value === null || !(limit.value > 0)) return null;
+
+  const tokens = usedTokens(totalsOf(since).tokens, opts.countCache);
+  if (tokens <= 0) return null;
+
+  return {
+    points: (tokens / limit.value) * PERCENT_LIMIT,
+    tokens,
+    calls: since.calls,
+    limit,
+  };
+}
+
 function buildReportedReading(
   acc: WindowAccumulator,
   entry: SnapshotWindow,
@@ -1176,25 +1254,33 @@ function buildReportedReading(
   scan: ScanSummary,
   stamps: readonly number[],
   nowMs: number,
+  since: WindowAccumulator | null,
 ): QuotaReading {
   const totals = totalsOf(acc);
+  const topUp = topUpFor(since, acc.limit, opts);
 
   const reading: QuotaReading = {
     provider: PROVIDER_ID,
     label: opts.plan.label,
     window: acc.window,
-    used: entry.usedPercentage,
+    // Clamped: the sum of a 97% figure and an hour of work is not 104%, and a
+    // bar past its own end reads as a bug rather than as a warning.
+    used:
+      topUp === null
+        ? entry.usedPercentage
+        : Math.min(PERCENT_LIMIT, entry.usedPercentage + topUp.points),
     limit: PERCENT_LIMIT,
     unit: 'percent',
     windowStart: acc.start === null ? null : acc.start.toISOString(),
     resetsAt: entry.resetsAt.toISOString(),
-    // The one branch that may say this, and only because the figure is
-    // Anthropic's, carried here verbatim from Claude Code's status line.
-    confidence: 'reported',
+    // 'reported' only while the figure is Anthropic's alone, carried here
+    // verbatim from Claude Code's status line. The moment anything of ours is
+    // added it is an estimate and has to be rendered as one.
+    confidence: topUp === null ? 'reported' : 'derived',
   };
 
   if (totals.costUsd !== null) reading.estimatedCostUsd = totals.costUsd;
-  reading.note = buildReportedNote(acc, totals, entry, window, opts, scan, stamps, nowMs);
+  reading.note = buildReportedNote(acc, totals, entry, window, opts, scan, stamps, nowMs, topUp);
   return reading;
 }
 
@@ -1306,6 +1392,25 @@ export const claudeCodeAdapter: QuotaAdapter = {
     // weekly accumulator can be filled while streaming.
     const weeklyAcc = makeAccumulator('weekly', weekly, opts.weekly);
     const streamed: WindowAccumulator[] = [weeklyAcc];
+
+    // Usage recorded after Anthropic last spoke, which is what tops the
+    // reported figure up. A second accumulator rather than a split of the first
+    // one: `foldEvents` already takes an interval, so the sub-window costs one
+    // more fold per batch and no new arithmetic. The grace is the same minute
+    // `callsAfter` uses, so the response that PRODUCED the figure cannot be
+    // counted on top of it.
+    const weeklySince =
+      reportedWeekly === null
+        ? null
+        : makeAccumulator(
+            'weekly',
+            {
+              start: new Date(reportedWeekly.observedAt.getTime() + REPORTED_ACTIVITY_GRACE_MS),
+              end: weekly.end,
+            },
+            opts.weekly,
+          );
+    if (weeklySince !== null) streamed.push(weeklySince);
 
     const sessionMs = Math.round(opts.sessionHours * MS_PER_HOUR);
     const ladder = anchorLadderMs(sessionMs);
@@ -1515,6 +1620,22 @@ export const claudeCodeAdapter: QuotaAdapter = {
     );
     foldEvents(sessionAcc, sessionCandidates);
 
+    // The session's own since-window. `sessionCandidates` reaches back to the
+    // reported window's start (see `liveFloorMs`), so every call that could be
+    // in here is in hand.
+    const sessionSince =
+      reportedSession === null || reportedSessionRange === null
+        ? null
+        : makeAccumulator(
+            'session',
+            {
+              start: new Date(reportedSession.observedAt.getTime() + REPORTED_ACTIVITY_GRACE_MS),
+              end: reportedSessionRange.end,
+            },
+            opts.session,
+          );
+    if (sessionSince !== null) foldEvents(sessionSince, sessionCandidates);
+
     /*
      * What is left to doubt?
      *
@@ -1567,12 +1688,30 @@ export const claudeCodeAdapter: QuotaAdapter = {
     const sessionReading =
       reportedSession === null
         ? buildReading(sessionAcc, opts, scan, anchor, statusLineNotePart(snapshot, 'five_hour', nowMs))
-        : buildReportedReading(sessionAcc, reportedSession, 'five_hour', opts, scan, anchorStamps, nowMs);
+        : buildReportedReading(
+            sessionAcc,
+            reportedSession,
+            'five_hour',
+            opts,
+            scan,
+            anchorStamps,
+            nowMs,
+            sessionSince,
+          );
 
     const weeklyReading =
       reportedWeekly === null
         ? buildReading(weeklyAcc, opts, scan, null, statusLineNotePart(snapshot, 'seven_day', nowMs))
-        : buildReportedReading(weeklyAcc, reportedWeekly, 'seven_day', opts, scan, anchorStamps, nowMs);
+        : buildReportedReading(
+            weeklyAcc,
+            reportedWeekly,
+            'seven_day',
+            opts,
+            scan,
+            anchorStamps,
+            nowMs,
+            weeklySince,
+          );
 
     return [sessionReading, weeklyReading];
   },

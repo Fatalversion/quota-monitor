@@ -1610,3 +1610,129 @@ describe('reported figures from the status line snapshot', () => {
     expect(widenings(debug)).toEqual([]);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* topping a stale reported figure up                                         */
+/* -------------------------------------------------------------------------- */
+
+describe('topping a reported figure up with the usage it cannot include', () => {
+  it('adds the calls recorded since, and marks the whole row an estimate', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      // Before the figure: already inside it, and must not be added twice.
+      assistantLine('2026-09-11T01:00:00.000Z', 'claude-opus-5', { input: 100_000 }),
+      // After it: this is what the status line never got to see.
+      assistantLine('2026-09-11T02:30:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(40, '2026-09-15T12:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 1_000_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    // 50,000 of a 1,000,000 cap is five points, on top of Anthropic's forty.
+    expect(weekly.used).toBe(45);
+    expect(weekly.unit).toBe('percent');
+    expect(weekly.limit).toBe(PERCENT_LIMIT);
+    // Ours now, in part, so it may not claim to be theirs.
+    expect(weekly.confidence).toBe('derived');
+    expect(weekly.note).toContain('TOPPED UP');
+    expect(weekly.note).toContain("40% of the 7-day limit is Anthropic's own figure");
+    expect(weekly.note).toContain('adds an estimate of 5%');
+    expect(weekly.note).toContain('1 Claude Code call recorded on this machine since');
+  });
+
+  it('tops the five-hour window up the same way', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T02:30:00.000Z', 'claude-opus-5', { input: 20_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(20, '2026-09-11T06:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', sessionLimit: 200_000 });
+    const session = byWindow(await claudeCodeAdapter.read(ctx), 'session');
+
+    expect(session.used).toBe(30);
+    expect(session.confidence).toBe('derived');
+    expect(session.note).toContain('TOPPED UP');
+  });
+
+  it("leaves the figure exactly as Anthropic stated it when nothing came after", async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T01:00:00.000Z', 'claude-opus-5', { input: 100_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(40, '2026-09-15T12:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 1_000_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    expect(weekly.used).toBe(40);
+    expect(weekly.confidence).toBe('reported');
+    expect(weekly.note).not.toContain('TOPPED UP');
+  });
+
+  it('does not add the call that produced the figure', async () => {
+    // Thirty seconds after the status line ran: the same response, written to
+    // the transcript a moment later. Inside the grace, so it is already in the
+    // percentage and adding it would count it twice.
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T02:00:30.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(40, '2026-09-15T12:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 1_000_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    expect(weekly.used).toBe(40);
+    expect(weekly.confidence).toBe('reported');
+  });
+
+  it('never tops a figure past 100', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T02:30:00.000Z', 'claude-opus-5', { input: 500_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(97, '2026-09-15T12:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 1_000_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    expect(weekly.used).toBe(PERCENT_LIMIT);
+    expect(percentUsed(weekly)).toBe(PERCENT_LIMIT);
+  });
+
+  it('says the figure is behind, and how to make it estimable, when there is no cap', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T02:30:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(40, '2026-09-15T12:00:00.000Z', '2026-09-11T02:00:00.000Z'),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 'none' });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    expect(weekly.used).toBe(40);
+    expect(weekly.confidence).toBe('reported');
+    expect(weekly.note).toContain('BEHIND');
+    expect(weekly.note).toContain('providers.claude-code.weeklyLimit');
+  });
+});
