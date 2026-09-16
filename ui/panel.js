@@ -228,7 +228,12 @@ function renderReading(reading, now) {
   const status = statusFor(pct);
 
   const wrap = el('div', 'reading');
-  wrap.append(el('div', 'reading-name', WINDOW_TITLE[reading.window] ?? reading.window));
+  // The scope, when there is one, is part of the name: a per-model weekly
+  // limit beside the plan's weekly limit is two different numbers wearing the
+  // same word otherwise.
+  const title = WINDOW_TITLE[reading.window] ?? reading.window;
+  const scope = typeof reading.scope === 'string' ? reading.scope.trim() : '';
+  wrap.append(el('div', 'reading-name', scope === '' ? title : `${title} · ${scope}`));
 
   /*
    * Three columns: label, clock, percentage.

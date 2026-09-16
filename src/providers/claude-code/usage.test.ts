@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   claudeCandidates,
+  modelsFromReport,
   observedFromReport,
   parseResetTime,
   parseUsageReport,
@@ -349,5 +350,34 @@ describe('recording a report', () => {
     expect(outcome.wrote).toBe(true);
     const snapshot = await readRateLimitSnapshot(file);
     expect(snapshot?.windows.seven_day?.usedPercentage).toBe(83);
+  });
+});
+
+describe('the per-model limit', () => {
+  it('is taken from the report and keyed by the name it printed', () => {
+    const report = parseUsageReport(REPORT, NOW);
+    const models = modelsFromReport(report, null);
+    expect(models['Fable']).toMatchObject({ usedPercentage: 76, clamped: false });
+    expect(models['Fable']?.resetsAt.toISOString()).toBe('2026-09-20T22:59:00.000Z');
+  });
+
+  it('is nothing at all when the report named no model', () => {
+    const report = parseUsageReport('Current week (all models): 50% used', NOW);
+    expect(modelsFromReport(report, null)).toEqual({});
+  });
+
+  it('reaches the snapshot when a probe records one', async () => {
+    const home = await makeHome();
+    const file = statusLineSnapshotPath(home);
+    await refreshFromUsage(file, NOW, {
+      env: {},
+      platform: 'linux',
+      homeDir: home,
+      candidates: ['/bin/claude'],
+      run: async () => ({ text: envelope(REPORT), reason: null }),
+    });
+
+    const snapshot = await readRateLimitSnapshot(file);
+    expect(snapshot?.models['Fable']?.usedPercentage).toBe(76);
   });
 });

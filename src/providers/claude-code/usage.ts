@@ -38,10 +38,11 @@
  *
  * THE THIRD WINDOW
  * ----------------
- * `/usage` reports a per-model weekly limit as well ("Current week (Fable)"),
- * which nothing in this tool models yet. It is parsed here so the data is in
- * hand, and deliberately not recorded: the snapshot's vocabulary is the two
- * windows Claude Code's status line speaks, and widening it is its own change.
+ * `/usage` reports a per-model weekly limit as well ("Current week (Fable):
+ * 76%"), and on a Max plan it is frequently the limit that stops the work
+ * first. The status line payload does NOT carry it, so a probe is the only way
+ * it is ever seen, and `RateLimitSnapshot.models` is where it is kept between
+ * probes.
  */
 
 import { spawn } from 'node:child_process';
@@ -51,6 +52,7 @@ import { delimiter, join } from 'node:path';
 import {
   type LimitWindow,
   type ObservedLimits,
+  type ObservedWindow,
   type RateLimitSnapshot,
   mergeSnapshot,
   readRateLimitSnapshot,
@@ -433,6 +435,28 @@ export async function probeUsage(
  * because a percentage without bounds cannot be placed in time; with neither,
  * the window is skipped.
  */
+/**
+ * The per-model limit as the merge takes it: keyed by the name /usage printed.
+ *
+ * Empty when the report named none, or when its reset time could not be read
+ * and no earlier figure for that model is on disk to borrow one from.
+ */
+export function modelsFromReport(
+  report: UsageReport,
+  existing: RateLimitSnapshot | null,
+): Record<string, ObservedWindow> {
+  const perModel = report.perModel;
+  if (perModel === null) return {};
+
+  const name = perModel.model.trim();
+  if (name === '') return {};
+
+  const resetsAt = perModel.resetsAt ?? existing?.models[name]?.resetsAt ?? null;
+  if (resetsAt === null) return {};
+
+  return { [name]: { usedPercentage: perModel.usedPercentage, resetsAt, clamped: false } };
+}
+
 export function observedFromReport(
   report: UsageReport,
   existing: RateLimitSnapshot | null,
@@ -471,11 +495,12 @@ export async function refreshFromUsage(
 
   const existing = await readRateLimitSnapshot(file);
   const observed = observedFromReport(report, existing);
-  if (Object.keys(observed).length === 0) {
+  const models = modelsFromReport(report, existing);
+  if (Object.keys(observed).length === 0 && Object.keys(models).length === 0) {
     return { report, wrote: false, reason: 'no window could be placed in time' };
   }
 
-  const { snapshot, changed } = mergeSnapshot(existing, observed, now);
+  const { snapshot, changed } = mergeSnapshot(existing, observed, now, models);
   if (changed) await writeRateLimitSnapshot(file, snapshot);
   return { report, wrote: changed, reason: null };
 }

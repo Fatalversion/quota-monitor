@@ -138,10 +138,27 @@ export interface SnapshotWindow extends ObservedWindow {
   history: readonly Observation[];
 }
 
+/** Longest model name kept, and the most of them. A guard, not a policy. */
+export const MAX_MODEL_NAME = 60;
+export const MAX_MODELS = 8;
+
 export interface RateLimitSnapshot {
   /** When the file was last written, which is when any window last changed. */
   writtenAt: Date;
   windows: { [W in LimitWindow]?: SnapshotWindow };
+  /**
+   * Per-model weekly limits, keyed by the name the provider printed.
+   *
+   * Claude Code's `/usage` reports one of these beside the plan's own weekly
+   * figure ("Current week (Fable): 76%"), and on a Max plan it is frequently
+   * the one that stops the work first. The status line payload does NOT carry
+   * it, so these only move when a probe runs - which is exactly why they are
+   * stored rather than recomputed, and why every reading built from them wears
+   * its `observedAt`.
+   *
+   * Keyed by name because the provider names them and we do not get an id.
+   */
+  models: Record<string, SnapshotWindow>;
 }
 
 /**
@@ -272,6 +289,7 @@ export function mergeSnapshot(
   existing: RateLimitSnapshot | null,
   observed: ObservedLimits,
   now: Date,
+  models: Record<string, ObservedWindow> = {},
 ): { snapshot: RateLimitSnapshot; changed: boolean } {
   const windows: RateLimitSnapshot['windows'] = {};
   let changed = false;
@@ -283,8 +301,32 @@ export function mergeSnapshot(
     if (merged !== kept) changed = true;
   }
 
+  // Per-model limits go through the very same merge: a higher figure inside one
+  // window wins, a later window replaces an earlier one, and the superseded
+  // figure lands in history. A model the newest report did not mention is kept
+  // rather than dropped - /usage names only the model you have been using, and
+  // forgetting the others every probe would make them flicker.
+  const kept: Record<string, SnapshotWindow> = { ...(existing?.models ?? {}) };
+  for (const [name, next] of Object.entries(models)) {
+    const clean = name.trim().slice(0, MAX_MODEL_NAME);
+    if (clean === '') continue;
+    const merged = mergeWindow(kept[clean], next, now);
+    if (merged === undefined) continue;
+    if (merged !== kept[clean]) changed = true;
+    kept[clean] = merged;
+  }
+
+  // Newest first, then capped: a plan cannot have eight weekly model limits,
+  // and a file that grows a key per model name forever is a bug with a slow fuse.
+  const trimmed: Record<string, SnapshotWindow> = {};
+  for (const [name, entry] of Object.entries(kept)
+    .sort((a, b) => b[1].observedAt.getTime() - a[1].observedAt.getTime())
+    .slice(0, MAX_MODELS)) {
+    trimmed[name] = entry;
+  }
+
   const writtenAt = changed || existing === null ? now : existing.writtenAt;
-  return { snapshot: { writtenAt, windows }, changed };
+  return { snapshot: { writtenAt, windows, models: trimmed }, changed };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -314,12 +356,33 @@ export function serializeSnapshot(snapshot: RateLimitSnapshot): string {
     };
   }
 
+  const models: Record<string, unknown> = {};
+  for (const [name, entry] of Object.entries(snapshot.models)) {
+    models[name] = {
+      usedPercentage: entry.usedPercentage,
+      resetsAt: entry.resetsAt.toISOString(),
+      observedAt: entry.observedAt.toISOString(),
+      clamped: entry.clamped,
+      ...(entry.history.length > 0
+        ? {
+            history: entry.history.map((seen) => ({
+              usedPercentage: seen.usedPercentage,
+              observedAt: seen.observedAt.toISOString(),
+            })),
+          }
+        : {}),
+    };
+  }
+
   const payload = {
     tool: 'quota-monitor',
     kind: SNAPSHOT_KIND,
     version: SNAPSHOT_VERSION,
     writtenAt: snapshot.writtenAt.toISOString(),
     windows,
+    // Omitted while empty, so a file from before per-model limits and a file
+    // from a plan that has none look the same.
+    ...(Object.keys(models).length > 0 ? { models } : {}),
   };
   return `${JSON.stringify(payload, null, 2)}\n`;
 }
@@ -353,25 +416,45 @@ export function parseSnapshot(text: string): RateLimitSnapshot | null {
   const windows: RateLimitSnapshot['windows'] = {};
 
   for (const window of LIMIT_WINDOWS) {
-    const entry = field(raw, window);
-    const used = field(entry, 'usedPercentage');
-    const resetsAt = isoDate(field(entry, 'resetsAt'));
-    const observedAt = isoDate(field(entry, 'observedAt'));
-    if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || used > 100) continue;
-    if (resetsAt === null || observedAt === null) continue;
-    windows[window] = {
-      usedPercentage: used,
-      resetsAt,
-      observedAt,
-      clamped: field(entry, 'clamped') === true,
-      // A file written before history existed simply has none. Same version:
-      // the field is additive, and a reader that ignores it loses nothing but
-      // the calibration.
-      history: parseHistory(field(entry, 'history'), observedAt),
-    };
+    const entry = snapshotWindow(field(raw, window));
+    if (entry !== null) windows[window] = entry;
   }
 
-  return { writtenAt, windows };
+  const models: Record<string, SnapshotWindow> = {};
+  const rawModels = field(parsed, 'models');
+  if (typeof rawModels === 'object' && rawModels !== null && !Array.isArray(rawModels)) {
+    for (const [name, value] of Object.entries(rawModels as Record<string, unknown>).slice(
+      0,
+      MAX_MODELS,
+    )) {
+      const entry = snapshotWindow(value);
+      if (entry === null) continue;
+      const clean = name.trim().slice(0, MAX_MODEL_NAME);
+      if (clean !== '') models[clean] = entry;
+    }
+  }
+
+  return { writtenAt, windows, models };
+}
+
+/** One stored window, or null when the file's version of it is not usable. */
+function snapshotWindow(value: unknown): SnapshotWindow | null {
+  const used = field(value, 'usedPercentage');
+  const resetsAt = isoDate(field(value, 'resetsAt'));
+  const observedAt = isoDate(field(value, 'observedAt'));
+  if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || used > 100) return null;
+  if (resetsAt === null || observedAt === null) return null;
+
+  return {
+    usedPercentage: used,
+    resetsAt,
+    observedAt,
+    clamped: field(value, 'clamped') === true,
+    // A file written before history existed simply has none. Same version: the
+    // field is additive, and a reader that ignores it loses nothing but the
+    // calibration.
+    history: parseHistory(field(value, 'history'), observedAt),
+  };
 }
 
 /**

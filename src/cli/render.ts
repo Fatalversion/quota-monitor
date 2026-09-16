@@ -268,9 +268,12 @@ function oneLine(text: string): string {
   return flat.slice(0, MAX_ERROR_LENGTH - 3) + '...';
 }
 
-/** The left-hand key: which provider, which window. */
+/** The left-hand key: which provider, which window, and what it applies to. */
 function headFor(reading: QuotaReading): string {
-  return (reading.provider + ' ' + reading.window).trim();
+  const scope = typeof reading.scope === 'string' && reading.scope.trim() !== ''
+    ? ' (' + reading.scope.trim() + ')'
+    : '';
+  return (reading.provider + ' ' + reading.window + scope).trim();
 }
 
 /** Parse an ISO timestamp, returning null for anything unusable. */

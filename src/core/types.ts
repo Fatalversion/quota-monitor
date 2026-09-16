@@ -80,6 +80,17 @@ export interface QuotaReading {
   /** Human label for the plan or scope, e.g. "Max 20x". */
   label: string;
   window: QuotaWindow;
+  /**
+   * What this limit applies to, when it is not the whole plan. A model name,
+   * typically: Claude Code reports a weekly limit for the plan AND a separate
+   * one per model, and Codex reports a bucket per limit id.
+   *
+   * Absent means the plan as a whole, which is what a reading usually is. Two
+   * readings of the same window can then coexist without either lying, so long
+   * as every surface prints the scope beside the window - "weekly 83%" and
+   * "weekly 76%" on adjacent rows is a bug report waiting to happen.
+   */
+  scope?: string;
   used: number;
   /** null when the plan has no published cap for this window. */
   limit: number | null;

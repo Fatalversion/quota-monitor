@@ -1908,7 +1908,41 @@ export const claudeCodeAdapter: QuotaAdapter = {
             calibrationFrom(weeklySpan, weeklyBetween, opts),
           );
 
-    return [sessionReading, weeklyReading];
+    /*
+     * The per-model weekly limit, when a probe has seen one.
+     *
+     * Reported and nothing else: no tokens, no cost, no top-up. The figure
+     * covers one model and the transcripts count every model, so there is no
+     * honest way to add local work to it - and `observedAt` already tells a
+     * reader how old it is. A window that has since reset is dropped rather
+     * than shown stale, exactly as `liveReported` does for the other two.
+     */
+    const modelReadings: QuotaReading[] = [];
+    for (const [name, entry] of Object.entries(snapshot?.models ?? {})) {
+      if (entry.resetsAt.getTime() <= nowMs) continue;
+      const startMs = entry.resetsAt.getTime() - LIMIT_WINDOW_MS.seven_day;
+      modelReadings.push({
+        provider: PROVIDER_ID,
+        label: opts.plan.label,
+        window: 'weekly',
+        scope: name,
+        used: entry.usedPercentage,
+        limit: PERCENT_LIMIT,
+        unit: 'percent',
+        windowStart: new Date(startMs).toISOString(),
+        resetsAt: entry.resetsAt.toISOString(),
+        observedAt: entry.observedAt.toISOString(),
+        confidence: 'reported',
+        note:
+          `${formatPercent(entry.usedPercentage)} of the weekly limit for "${name}" is ` +
+          `Anthropic's own figure, from "claude -p /usage" - the status line does not carry ` +
+          `per-model limits, so this one moves only when a refresh asks. On a Max plan it is ` +
+          `often the limit that stops the work first, which is why it is shown beside the ` +
+          `plan's own weekly figure rather than folded into it`,
+      });
+    }
+
+    return [sessionReading, weeklyReading, ...modelReadings];
   },
 };
 

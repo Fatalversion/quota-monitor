@@ -701,3 +701,19 @@ function stripAnsi(text: string): string {
   }
   return out;
 }
+
+describe('a limit that applies to one model', () => {
+  it('names the scope in the key column, so two weekly rows cannot be confused', () => {
+    const plan: QuotaReading = {
+      ...weeklyDerived,
+      used: 83,
+      limit: 100,
+      unit: 'percent',
+      confidence: 'reported',
+    };
+    const model: QuotaReading = { ...plan, used: 76, scope: 'Fable' };
+
+    expect(renderReading(plan, NOW).join(' ')).toContain('claude-code weekly');
+    expect(renderReading(model, NOW).join(' ')).toContain('claude-code weekly (Fable)');
+  });
+});
