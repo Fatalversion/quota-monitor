@@ -54,10 +54,18 @@
  */
 
 import { parseRateLimitLine, planLabel } from './parse.js';
+import {
+  DEFAULT_LIMIT_ID,
+  probeRateLimits,
+  probeSnapshotPath,
+  readProbeSnapshot,
+  writeProbeSnapshot,
+} from './probe.js';
 import { DEFAULT_ROLLOUT_LIMIT, codexHomeDir, listRollouts, streamLines } from './rollouts.js';
 
 import type { AdapterContext, QuotaAdapter, QuotaReading, QuotaWindow } from '../../core/types.js';
 import type { RateSnapshot, RateWindow } from './parse.js';
+import type { ProbeResult, ProbedLimit } from './probe.js';
 import type { RolloutEntry, RolloutSelection } from './rollouts.js';
 
 /** Adapter id. Matches the directory name and the config key. */
@@ -126,6 +134,14 @@ const PLAIN_BALANCE = /^\d[\d,.]{0,15}$/;
  * test in `index.test.ts` guards the set against that regression.
  */
 export interface CodexOptions {
+  /**
+   * Let a refresh ask Codex itself for the current limits. Default true.
+   *
+   * It costs no quota and takes about a second, but it does start a process
+   * and that process makes a network call of its own. Off means refreshes read
+   * only the rollout logs, which move when you next run Codex and not before.
+   */
+  rateLimitProbe?: boolean;
   /** Override the Codex home directory. Also honours $CODEX_HOME. */
   dir?: string;
   /** Rollouts opened in one read, newest first. Default 25. */
@@ -141,6 +157,7 @@ interface ResolvedOptions {
   codexDir: string;
   maxFiles: number;
   includeArchived: boolean;
+  rateLimitProbe: boolean;
 }
 
 /** The snapshot the scan settled on, plus how much work it took to find it. */
@@ -195,6 +212,7 @@ function resolveOptions(ctx: AdapterContext): ResolvedOptions {
     codexDir: resolveCodexDir(ctx),
     maxFiles,
     includeArchived: optBoolean(ctx.options, 'includeArchived') ?? false,
+    rateLimitProbe: optBoolean(ctx.options, 'rateLimitProbe') ?? true,
   };
 }
 
@@ -500,6 +518,54 @@ function buildReading(
 /* the adapter                                                                */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A reading from a probe, which is a different kind of fact from a log line.
+ *
+ * The rollout reader answers with whatever Codex last wrote; this answers with
+ * what OpenAI says right now. Both are `reported` - the percentage is theirs
+ * either way - and `observedAt` is what separates them on screen.
+ */
+function buildProbedReading(
+  window: QuotaWindow,
+  rate: RateWindow,
+  limit: ProbedLimit,
+  result: ProbeResult,
+  now: Date,
+): QuotaReading {
+  const scoped = limit.limitId !== DEFAULT_LIMIT_ID;
+  const reading: QuotaReading = {
+    provider: PROVIDER_ID,
+    label: planLabel(limit.planType),
+    window,
+    used: rate.usedPercent,
+    limit: PERCENT_LIMIT,
+    unit: 'percent',
+    windowStart: windowStartOf(rate),
+    resetsAt: rate.resetsAt.toISOString(),
+    observedAt: result.at.toISOString(),
+    confidence: 'reported',
+  };
+
+  // A per-model bucket says what it covers, so two rows of the same window can
+  // never be read as one contradicting the other.
+  if (scoped) reading.scope = limit.limitName ?? limit.limitId;
+
+  const age = formatAge(Math.max(0, now.getTime() - result.at.getTime()));
+  reading.note =
+    `${formatPercent(rate.usedPercent)} of the ${formatWindowLength(rate.windowMinutes)} window is ` +
+    `OpenAI's own figure, read from Codex itself (the app-server's ` +
+    `account/rateLimits/read) ${age === 'less than a minute' ? 'just now' : `${age} ago`} - not from ` +
+    `a rollout log, so it did not wait for you to run Codex` +
+    (scoped
+      ? `; this row is the limit for "${limit.limitName ?? limit.limitId}" alone, beside the ` +
+        `plan's own`
+      : '') +
+    `. Asking costs no quota: the answer carries no tokens and no cost, and no new session is ` +
+    `created`;
+
+  return reading;
+}
+
 export const codexAdapter: QuotaAdapter = {
   id: PROVIDER_ID,
   displayName: DISPLAY_NAME,
@@ -551,10 +617,77 @@ export const codexAdapter: QuotaAdapter = {
     const opts = resolveOptions(ctx);
     const now = ctx.now();
 
+    /*
+     * A person asked, so ask OpenAI.
+     *
+     * Nothing under ~/.codex refreshes without a model turn - the rollout logs
+     * are written as a session runs and not otherwise - so a figure on disk is
+     * as old as the last time Codex was used. The app-server answers with the
+     * live one for about a second and no quota, and the answer is kept so the
+     * 60-second poll shows it too.
+     */
+    const probeFile = probeSnapshotPath(ctx.homeDir);
+    if (ctx.refresh === true && opts.rateLimitProbe) {
+      const probed = await probeRateLimits({
+        env: process.env,
+        platform: process.platform,
+        homeDir: ctx.homeDir,
+        now,
+      });
+      if (probed.result === null) {
+        ctx.debug(
+          `${PROVIDER_ID}: asked codex for its rate limits and got nothing usable ` +
+            `(${probed.reason ?? 'no reason given'}); the rollout logs stand`,
+        );
+      } else {
+        const wrote = await writeProbeSnapshot(probeFile, probed.result);
+        ctx.debug(
+          `${PROVIDER_ID}: codex reported ` +
+            probed.result.limits
+              .map(
+                (limit) =>
+                  `${limit.limitName ?? limit.limitId} ` +
+                  `${limit.session === null ? '' : `5h ${formatPercent(limit.session.usedPercent)} `}` +
+                  `${limit.weekly === null ? '' : `7d ${formatPercent(limit.weekly.usedPercent)}`}`.trim(),
+              )
+              .join(', ') +
+            (wrote ? '' : ' (but the answer could not be stored)'),
+        );
+      }
+    } else if (ctx.refresh === true) {
+      ctx.debug(
+        `${PROVIDER_ID}: refresh asked for, but providers.${PROVIDER_ID}.rateLimitProbe is off`,
+      );
+    }
+
+    const probeSnapshot = opts.rateLimitProbe ? await readProbeSnapshot(probeFile) : null;
+
     const selection = await listRollouts(opts.codexDir, {
       limit: opts.maxFiles,
       includeArchived: opts.includeArchived,
     });
+
+    /*
+     * Every limit the probe saw, whenever the probe is the newer source.
+     *
+     * "Newer" and not "better": a rollout written after the last probe carries
+     * usage the probe cannot have seen, and picking the probe then would move
+     * a bar backwards. The comparison is on the two instants, below, once the
+     * rollout snapshot is in hand.
+     */
+    const probed = probeSnapshot;
+    const probedReadings = (probed?.limits ?? []).flatMap((limit) =>
+      (
+        [
+          ['session', limit.session],
+          ['weekly', limit.weekly],
+        ] as ReadonlyArray<readonly [QuotaWindow, RateWindow | null]>
+      ).flatMap(([window, rate]) =>
+        rate === null || probed === null
+          ? []
+          : [buildProbedReading(window, rate, limit, probed, now)],
+      ),
+    );
 
     ctx.debug(
       `${PROVIDER_ID}: ${selection.scanned} ${plural(selection.scanned, 'rollout')} under ` +
@@ -564,15 +697,29 @@ export const codexAdapter: QuotaAdapter = {
           : ''),
     );
 
-    if (selection.files.length === 0) return [];
+    if (selection.files.length === 0) return probedReadings;
 
     const found = await findSnapshot(selection.entries, ctx);
     if (found === null) {
       ctx.debug(
         `${PROVIDER_ID}: no rate_limits snapshot in the newest ${selection.files.length} ` +
-          `${plural(selection.files.length, 'rollout')}; reporting nothing rather than zero`,
+          `${plural(selection.files.length, 'rollout')}` +
+          (probedReadings.length > 0
+            ? '; the probe answered, so that is what is shown'
+            : '; reporting nothing rather than zero'),
       );
-      return [];
+      return probedReadings;
+    }
+
+    // The newer of the two sources wins for the plan's own windows. A rollout
+    // written since the probe holds usage the probe never saw, and taking the
+    // probe then would walk a percentage backwards.
+    if (probeSnapshot !== null && probeSnapshot.at.getTime() >= found.snapshot.at.getTime()) {
+      ctx.debug(
+        `${PROVIDER_ID}: codex's own answer (${probeSnapshot.at.toISOString()}) is newer than the ` +
+          `newest rollout snapshot (${found.snapshot.at.toISOString()}); using it`,
+      );
+      return probedReadings;
     }
 
     const snapshot = found.snapshot;
@@ -586,6 +733,10 @@ export const codexAdapter: QuotaAdapter = {
       if (rate === null) continue;
       readings.push(buildReading(window, rate, snapshot, selection, found, now));
     }
+
+    // Scoped rows survive either way: a rollout log carries no per-model
+    // bucket, so there is nothing for it to be newer than.
+    readings.push(...probedReadings.filter((reading) => reading.scope !== undefined));
     return readings;
   },
 };
