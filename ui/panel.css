@@ -249,14 +249,25 @@ body[data-dock="bottom"] .card {
 }
 
 /*
- * OpenAI's Blossom is drawn inside a 716 canvas and fills about half of it, so
- * 74% of the badge put roughly 37% on screen - which is why it read small
- * beside marks that fill their own viewBox. The file is untouched; the box it
- * is given is bigger.
+ * OpenAI's Blossom fills about half of its own 716 canvas, so a box the size of
+ * the badge puts barely a third of the badge on screen. It needs to be drawn
+ * bigger than the chip - but NOT by giving it a bigger box.
+ *
+ * An oversized grid item is the trap: the badge centres its child with
+ * place-items, and when that child is larger than the area, WebView2 clamps it
+ * to the start edge rather than overflowing evenly. The mark then sits up and
+ * to the left, which is exactly how it looked on the rail - small AND
+ * misaligned, from one mistake rather than two.
+ *
+ * A transform scales the drawing without touching layout, so the box stays 100%
+ * of the badge, centring stays exact, and the badge's own overflow: hidden
+ * trims whatever spills. 1.3 x 51% puts about two thirds of the chip in ink,
+ * which is where the other marks sit.
  */
 .badge[data-provider='codex'] > .mark {
-  width: 112%;
-  height: 112%;
+  width: 100%;
+  height: 100%;
+  transform: scale(1.3);
 }
 
 .badge[data-provider='copilot'] > .mark {
@@ -777,6 +788,81 @@ body[data-mode="rail"] .rail {
   margin-top: auto;
 }
 
+/*
+ * ONE PROVIDER, upright: two windows side by side inside the same 72px.
+ *
+ * The badge moves out of the column grid and sits above both, because it
+ * identifies the provider rather than either window. Two 9px bars and a 10px
+ * gap fit the rail's 56px of usable width with room to spare.
+ */
+.rail[data-mode='single'] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.rail-pair {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.rail-window {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-height: 0;
+}
+
+.rail-wl {
+  font-family: var(--font);
+  font-size: 8.5px;
+  line-height: 1;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+}
+
+.rail[data-mode='single'] .bar {
+  width: 9px;
+}
+
+/*
+ * THREE OR MORE, upright: a list.
+ *
+ * The rail's columns thin with every provider - three fit at 7px, four would
+ * be 15px wide with "100%" underneath them - but its height is free. So it
+ * stops being columns and becomes rows, and the number carries the colour, the
+ * same answer the dock reaches for the same reason.
+ */
+.rail[data-mode='compact'] {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 9px;
+}
+
+.rail-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.rail-rownum {
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--tone, var(--text-dim));
+  font-variant-numeric: tabular-nums;
+  min-width: 26px;
+  text-align: right;
+}
+
 .rail-num {
   font-family: var(--font);
   /* Small enough that "100%" fits the column without the columns resizing as
@@ -832,9 +918,24 @@ body[data-mode="bar"] .dock {
   min-width: 0;
 }
 
+/*
+ * The bar's own column, with the number under it.
+ *
+ * Wider and thicker than the panel's: this dock is the collapsed state, read
+ * in passing and often from the corner of an eye, and the bar is the whole
+ * message. The panel keeps 4px because it has words beside it doing half the
+ * work; here there are none.
+ */
+.dock-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
 .dock-item .bar {
-  width: 84px;
-  height: var(--bar-h);
+  width: 116px;
+  height: 7px;
 }
 
 .dock-item .bar > i {
@@ -842,10 +943,76 @@ body[data-mode="bar"] .dock {
   width: var(--fill, 0%);
 }
 
+/*
+ * Under the bar, and no longer reserving a 30px column beside it - the width
+ * is the bar's now. Aligned to the end so the digits line up with where the
+ * bar finishes, which is where the eye already is.
+ */
 .dock-pct {
   font-family: var(--font);
-  font-size: 11px;
+  font-size: 10.5px;
+  line-height: 1;
   color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/*
+ * ONE PROVIDER, on its side: both windows, each with its own bar.
+ *
+ * Nothing to compare against, so the width that two providers would have spent
+ * on a second column is spent on detail instead - which is the reading people
+ * actually want from one provider, since the session being fine says nothing
+ * about the week.
+ */
+.dock-solo .dock-stack {
+  gap: 5px;
+}
+
+.dock-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.dock-window {
+  font-family: var(--font);
+  font-size: 9px;
+  line-height: 1;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+  /* "5h" and "7d" are two characters; "30d" is three. Fixed, so the two bars
+     start at the same x and can be compared by length. */
+  min-width: 18px;
+}
+
+.dock-solo .dock-line .bar {
+  width: 150px;
+  height: 6px;
+}
+
+.dock-solo .dock-pct {
+  min-width: 30px;
+}
+
+/*
+ * THREE OR MORE: badge and number, no bar.
+ *
+ * At four providers a bar is down to about 72px and still costs 9px of gap and
+ * a column of digits; at five it stops being a length worth reading. The
+ * number takes the status colour the bar was carrying, so escalation still
+ * arrives without being read - which is the whole job of a dock you glance at.
+ */
+.dock-tight {
+  gap: 7px;
+}
+
+.dock-num {
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--tone, var(--text));
   font-variant-numeric: tabular-nums;
   min-width: 30px;
   text-align: right;

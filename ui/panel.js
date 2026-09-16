@@ -465,6 +465,45 @@ export function renderRail(root, results, hiddenCount = 0) {
     return;
   }
 
+  const mode = collapsedMode(items.length);
+  root.dataset.mode = mode;
+
+  // One provider: both its windows as columns of their own, inside the same
+  // 72px. The badge sits above them rather than above one of them.
+  if (mode === 'single') {
+    const only = items[0];
+    const badge = makeBadge(only.id);
+    badge.dataset.tauriDragRegion = 'deep';
+    root.append(badge);
+
+    const windows = windowsFor(results.find((r) => r.id === only.id));
+    const pair = el('div', 'rail-pair');
+    for (const w of windows.length > 0 ? windows : [{ short: '', pct: only.pct, status: only.status }]) {
+      const column = el('div', 'rail-window');
+      column.append(el('span', 'rail-wl', w.short));
+      column.append(makeBar(w.pct, w.status));
+      column.append(el('span', 'rail-num', w.pct === null ? '–' : `${Math.round(w.pct)}%`));
+      pair.append(column);
+    }
+    root.append(pair);
+    return;
+  }
+
+  // Three or more: the columns would be thinner than the numbers under them,
+  // so the rail becomes a list and grows downward, which is the one direction
+  // it has to spare.
+  if (mode === 'compact') {
+    for (const item of items) {
+      const row = el('div', 'rail-row');
+      const badge = makeBadge(item.id);
+      badge.dataset.tauriDragRegion = 'deep';
+      row.append(badge);
+      row.append(makeNumber('rail-rownum', item.pct, item.status));
+      root.append(row);
+    }
+    return;
+  }
+
   for (const item of items) {
     const badge = makeBadge(item.id);
     badge.dataset.tauriDragRegion = 'deep';
@@ -472,6 +511,73 @@ export function renderRail(root, results, hiddenCount = 0) {
     root.append(makeBar(item.pct, item.status));
     root.append(el('div', 'rail-num', item.pct === null ? '–' : `${Math.round(item.pct)}%`));
   }
+}
+
+/**
+ * How many providers before a collapsed layout changes shape.
+ *
+ * The two collapsed views run out of room in opposite directions - the dock
+ * out of WIDTH, the rail out of width as well, because its columns get thinner
+ * with every provider while its height is free. So both give up the same thing
+ * at the same count, and for the same reason: a bar is a length, a length needs
+ * room, and below a certain room a bar says less than the number it replaces.
+ *
+ *   one    the provider's two windows, side by side. Nothing to compare
+ *          against, so the space buys detail instead.
+ *   two    a bar each. The shape everything else is designed around.
+ *   three+ badge and percentage only, the digits carrying the status colour.
+ *
+ * Escalation survives the switch, which is the point: the three tones are the
+ * same ones the bars use, so a red 93% arrives without being read.
+ */
+export const COMPACT_AT = 3;
+
+export function collapsedMode(count) {
+  if (count <= 1) return 'single';
+  return count >= COMPACT_AT ? 'compact' : 'bars';
+}
+
+/** Short label for a window, for the places that have room for two characters. */
+const WINDOW_SHORT = {
+  session: '5h',
+  daily: '24h',
+  weekly: '7d',
+  monthly: '30d',
+  balance: 'bal',
+};
+
+/**
+ * The windows a single provider should show, shortest first, at most two.
+ *
+ * Scoped readings are left out - a per-model limit is a real number, but it is
+ * not one of the plan's own windows, and two rows labelled "7d" that disagree
+ * is the confusion `scope` exists to prevent. The panel still shows it.
+ */
+export function windowsFor(result, limit = 2) {
+  if (!result || result.ok === false) return [];
+  const rank = (reading) => SPEND_WINDOW_RANK[reading.window] ?? 99;
+  return readingsOf(result)
+    .filter((reading) => reading.scope === undefined && percentOf(reading) !== null)
+    .sort((a, b) => rank(a) - rank(b))
+    .slice(0, limit)
+    .map((reading) => {
+      const pct = percentOf(reading);
+      return {
+        window: reading.window,
+        short: WINDOW_SHORT[reading.window] ?? windowLabel(reading.window),
+        pct,
+        status: statusFor(pct),
+      };
+    });
+}
+
+/** The percentage, wearing its status colour. Used where no bar is drawn. */
+function makeNumber(className, pct, status) {
+  const node = el('div', className, pct === null ? '–' : `${Math.round(pct)}%`);
+  node.dataset.status = status;
+  // The tone the bar would have had, moved onto the digits.
+  if (pct !== null) node.style.setProperty('--tone', TONE[status]);
+  return node;
 }
 
 /** Horizontal dock: badge, bar, percentage, repeated. */
@@ -484,11 +590,58 @@ export function renderDock(root, results, hiddenCount = 0) {
     return;
   }
 
+  const mode = collapsedMode(items.length);
+  root.dataset.mode = mode;
+
+  // One provider: its two windows, each with its own bar, because there is
+  // nothing to compare it against and the room is there.
+  if (mode === 'single') {
+    const only = items[0];
+    const cell = el('div', 'dock-item dock-solo');
+    cell.append(makeBadge(only.id));
+    const stack = el('div', 'dock-stack');
+    const windows = windowsFor(results.find((r) => r.id === only.id));
+    for (const w of windows.length > 0 ? windows : [{ short: '', pct: only.pct, status: only.status }]) {
+      const line = el('div', 'dock-line');
+      line.append(el('span', 'dock-window', w.short));
+      line.append(makeBar(w.pct, w.status));
+      line.append(el('span', 'dock-pct', w.pct === null ? '–' : `${Math.round(w.pct)}%`));
+      stack.append(line);
+    }
+    cell.append(stack);
+    root.append(cell);
+    return;
+  }
+
+  // Three or more: no bar survives the division, so the number carries the
+  // colour instead.
+  if (mode === 'compact') {
+    for (const item of items) {
+      const cell = el('div', 'dock-item dock-tight');
+      cell.append(makeBadge(item.id));
+      cell.append(makeNumber('dock-num', item.pct, item.status));
+      root.append(cell);
+    }
+    return;
+  }
+
   for (const item of items) {
     const cell = el('div', 'dock-item');
     cell.append(makeBadge(item.id));
-    cell.append(makeBar(item.pct, item.status));
-    cell.append(el('div', 'dock-pct', item.pct === null ? '–' : `${Math.round(item.pct)}%`));
+
+    /*
+     * Bar over number, not bar beside number.
+     *
+     * Side by side, the percentage took a fixed 30px out of every cell and the
+     * bar got what was left - so the one element that carries the reading at a
+     * glance was the one being squeezed. Stacked, the bar has the whole cell
+     * width and the number sits under it, which is also the reading order:
+     * see the length, then check the figure.
+     */
+    const stack = el('div', 'dock-stack');
+    stack.append(makeBar(item.pct, item.status));
+    stack.append(el('div', 'dock-pct', item.pct === null ? '–' : `${Math.round(item.pct)}%`));
+    cell.append(stack);
     root.append(cell);
   }
 }
