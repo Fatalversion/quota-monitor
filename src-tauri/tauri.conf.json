@@ -15,7 +15,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
     "category": "DeveloperTool",
     "shortDescription": "How much of each AI coding subscription you have burned.",
     "longDescription": "quota-monitor reads the logs the AI coding tools you already have installed leave on disk and shows how much of each subscription window you have used. Local-first, read-only, no accounts and no network.",
@@ -26,6 +26,17 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
