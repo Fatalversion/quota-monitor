@@ -59,6 +59,12 @@ export type QuotaWindow = 'session' | 'daily' | 'weekly' | 'monthly' | 'balance'
  * `percentUsed` keeps working unchanged. It is the only unit that can honestly
  * pair with confidence 'reported', because every other unit needs a cap that
  * we, not the provider, supplied.
+ *
+ * A percent reading may still be `derived`, and one case produces it: a
+ * reported figure that has since been topped up with local usage the provider
+ * had not seen when it spoke. The anchor is theirs, the addition is ours, and
+ * the whole reading is therefore an estimate. See `topUpFor` in the Claude
+ * Code adapter.
  */
 export type QuotaUnit = 'requests' | 'tokens' | 'credits' | 'usd' | 'percent';
 
