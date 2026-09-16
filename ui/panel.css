@@ -270,6 +270,68 @@ body[data-mode="panel"] .panel {
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * The refresh control. Sized and coloured as the header's other chrome text -
+ * it is a way to ask again, not a call to action, and it must not outshout the
+ * figures it reloads.
+ *
+ * `.panel` sets `cursor: auto` and `user-select: text` so a figure can be
+ * copied, and the header above sets `cursor: grab`; a button inherits
+ * whichever it sits in, so both are restated here.
+ */
+.panel-refresh {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 0 1px;
+  background: none;
+  font-family: var(--font);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+}
+
+.panel-refresh:hover {
+  color: var(--text);
+}
+
+/*
+ * Keyboard only. A ring on every mouse press would be noise, and the press
+ * already pins the panel, which is feedback enough.
+ */
+.panel-refresh:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  color: var(--text);
+}
+
+/*
+ * While a read is in flight. The sidecar takes a second or two on a week of
+ * transcripts, and a control that does nothing visible for that long reads as
+ * broken - so the glyph turns, which is the whole feedback budget a 9.5px row
+ * has.
+ */
+body[data-loading="true"] .panel-refresh {
+  animation: panel-refresh-spin 0.9s linear infinite;
+  color: var(--text-dim);
+}
+
+@keyframes panel-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Asked not to animate: say the same thing by dimming instead. */
+@media (prefers-reduced-motion: reduce) {
+  body[data-loading="true"] .panel-refresh {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
 .panel-pin {
   display: none;
   letter-spacing: 0.06em;
