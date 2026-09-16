@@ -160,20 +160,6 @@ body[data-dock="bottom"] .card {
 }
 
 /*
- * Acrylic is painted by the Windows compositor BEHIND the webview, so it is
- * only visible if we stop painting over it. A tint is still needed: raw
- * acrylic over a bright desktop washes the text out completely.
- *
- * Set only when the user has transparency enabled in Windows settings. Someone
- * who turned it off did so on purpose, often for battery or motion sensitivity,
- * and overriding that would be rude.
- */
-body[data-acrylic="true"] .card {
-  background: color-mix(in srgb, var(--card-solid) 62%, transparent);
-  box-shadow: 0 0 0 1px rgb(255 255 255 / 8%) inset;
-}
-
-/*
  * Provider mark. The glyph is set as text so there is no image to load, no
  * icon font, and nothing to go stale if a vendor changes its logo -- which
  * also keeps us clear of shipping someone else's trademark as an asset.

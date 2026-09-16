@@ -130,14 +130,6 @@
           if (theme.track) root.setProperty('--track', theme.track);
           if (theme.text) root.setProperty('--text', theme.text);
           if (theme.textDim) root.setProperty('--text-dim', theme.textDim);
-
-          /*
-           * When the compositor is painting acrylic behind us, the card must
-           * stop painting its own opaque ground or the blur is invisible.
-           * Respecting EnableTransparency matters: a user who turned it off
-           * did so deliberately, often for battery or motion reasons.
-           */
-          body.dataset.acrylic = theme.transparency ? 'true' : 'false';
         } catch {
           /* No system theme available. The stylesheet defaults stand. */
         }

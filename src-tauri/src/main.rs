@@ -298,11 +298,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         visibility_path,
     ));
 
-    // Settle the compositor effect BEFORE any window exists. A webview starts
-    // loading the moment it is created and asks for the theme immediately, so
-    // deciding after creation meant the first answer was always "opaque".
-    theme::decide_effect();
-
     let mut running = Vec::new();
 
     if mode.wants_strip() {
@@ -337,12 +332,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-
-    // Windows are built by now, which is what window-vibrancy needs, and
-    // setup still runs on the main thread, which is the other thing it needs.
-    // Applies mica or acrylic only when the user has transparency switched on;
-    // it logs which effect went on, or why none did.
-    theme::apply_window_effects(&handle);
 
     log::line(&format!("running: {}", running.join(" + ")));
     if !mode.wants_tray() {

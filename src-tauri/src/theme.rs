@@ -1,10 +1,12 @@
 //! The system theme: inherit Windows rather than invent a palette.
 //!
-//! The user asked for the widget to take the taskbar's colour scheme and,
-//! where the compositor offers it, the taskbar's transparency. Windows already
-//! stores both, so this module reads them and derives the eight colours the
+//! The user asked for the widget to take the taskbar's colour scheme, so this
+//! module reads what Windows already stores and derives the eight colours the
 //! stylesheet needs. Nothing here writes to the registry, talks to the
 //! network, or looks at another tool's files.
+//!
+//! Colours are all it derives. The taskbar's *transparency* is deliberately
+//! not inherited - see the effects section below for what that cost and why.
 //!
 //! # Byte order
 //!
@@ -203,8 +205,6 @@ pub const DEFAULT_BASE: Rgb = Rgb::new(0x38, 0x36, 0x33);
 pub struct RawTheme {
     /// `Personalize\AppsUseLightTheme`. 0 means dark.
     pub apps_use_light_theme: Option<u32>,
-    /// `Personalize\EnableTransparency`. 0 means the user turned it off.
-    pub enable_transparency: Option<u32>,
     /// `DWM\AccentColor`, ABGR.
     pub accent_color: Option<u32>,
     /// `Explorer\Accent\AccentColorMenu`, ABGR.
@@ -222,7 +222,6 @@ pub struct RawTheme {
 #[serde(rename_all = "camelCase")]
 pub struct SystemTheme {
     pub dark: bool,
-    pub transparency: bool,
     pub accent: String,
     pub accent_soft: String,
     pub base: String,
@@ -234,17 +233,10 @@ pub struct SystemTheme {
 
 /// Turn raw registry DWORDs into the palette. Pure, so it can be tested
 /// without a registry.
-///
-/// `transparency` here is only the user's *preference*. Whether an effect was
-/// actually applied is a separate question, answered in `current`.
 pub fn derive(raw: RawTheme) -> SystemTheme {
     // Missing means dark: the widget is a dark-first design, and a light card
     // arrived at by accident would be the worse guess.
     let dark = raw.apps_use_light_theme.map(|v| v == 0).unwrap_or(true);
-    // Missing means off. Switching on an effect we cannot confirm the user
-    // wants is the more damaging of the two possible errors.
-    let transparency = raw.enable_transparency.map(|v| v != 0).unwrap_or(false);
-
     let system_accent = raw
         .accent_color
         .or(raw.accent_color_menu)
@@ -272,7 +264,6 @@ pub fn derive(raw: RawTheme) -> SystemTheme {
 
     SystemTheme {
         dark,
-        transparency,
         accent: accent.hex(),
         accent_soft: accent_soft.hex(),
         base: base.hex(),
@@ -315,7 +306,6 @@ pub fn read_raw() -> RawTheme {
 
     let raw = RawTheme {
         apps_use_light_theme: dword(&personalize, "AppsUseLightTheme"),
-        enable_transparency: dword(&personalize, "EnableTransparency"),
         accent_color: dword(&dwm, "AccentColor"),
         accent_color_menu: dword(&explorer, "AccentColorMenu"),
         start_color_menu: dword(&explorer, "StartColorMenu"),
@@ -346,9 +336,6 @@ fn report_gaps(raw: &RawTheme) {
     if raw.apps_use_light_theme.is_none() {
         missing.push("AppsUseLightTheme");
     }
-    if raw.enable_transparency.is_none() {
-        missing.push("EnableTransparency");
-    }
     if raw.accent_color.is_none() && raw.accent_color_menu.is_none() {
         missing.push("AccentColor");
     }
@@ -369,204 +356,35 @@ fn report_gaps(raw: &RawTheme) {
 
 /* ------------------------------------------------------------ effects -- */
 
-/// Which compositor effect is actually on the two windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Effect {
-    /// Opaque. Either the user turned transparency off, or nothing here
-    /// supports it.
-    None,
-    /// Windows 10 1809+ blur-behind.
-    Acrylic,
-    /// Windows 11 22000+ backdrop.
-    Mica,
-}
+// There is deliberately NO mica and NO acrylic here, and putting one back is
+// not a one-line change.
+//
+// Windows paints a compositor backdrop across the whole window RECTANGLE. It
+// knows nothing about the 16px corners the card draws, and the window has to
+// be transparent for those corners to exist at all - so the backdrop filled
+// the corner regions the rounding leaves empty, and the widget sat on a dark
+// square slab. That is exactly what it looked like on build 19045: a rounded
+// card on a square block, reported as a rendering fault, which is what it was.
+//
+// The card also had to go translucent to let the blur through, so the slab
+// showed through the card's own colour as well - the fault was visible across
+// the whole widget, not only at its corners.
+//
+// Windows 10 offers no way to clip that backdrop to a rounded shape.
+// SetWindowRgn is the only lever and it hard-clips, so it trades a squared
+// corner for a stair-stepped one. Windows 11's own rounding is 8px on all four
+// corners, which is neither the card's 16px nor the corners it squares off
+// against the bezel.
+//
+// So the card paints its own opaque ground and owns its shape. If a blur ever
+// comes back it has to arrive with a shape story for BOTH windows, and one
+// that survives the strip expanding, the dock moving to another edge, and the
+// corners the page squares off where it meets the screen.
 
-impl Effect {
-    fn is_active(self) -> bool {
-        !matches!(self, Effect::None)
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Effect::None => "none",
-            Effect::Acrylic => "acrylic",
-            Effect::Mica => "mica",
-        }
-    }
-}
-
-static APPLIED: std::sync::OnceLock<Effect> = std::sync::OnceLock::new();
-
-/// What `apply_window_effects` settled on. `Effect::None` until it has run,
-/// which is the safe direction: reporting `transparency: true` to a card that
-/// then stops painting its own ground, over a window with no blur behind it,
-/// would leave the widget invisible.
-pub fn applied_effect() -> Effect {
-    APPLIED.get().copied().unwrap_or(Effect::None)
-}
-
-/// Mica landed in Windows 11.
-const BUILD_WIN11: u32 = 22_000;
-/// Acrylic blur-behind landed in Windows 10 1809.
-const BUILD_WIN10_1809: u32 = 17_763;
-
-/// Windows build number, or `None` where the question does not apply.
-#[cfg(windows)]
-fn build_number() -> Option<u32> {
-    Some(windows_version::OsVersion::current().build)
-}
-
-#[cfg(not(windows))]
-fn build_number() -> Option<u32> {
-    None
-}
-
-/// Settle which effect we intend to use, BEFORE any window exists.
-///
-/// This split exists to close a first-paint race. A webview starts loading the
-/// instant it is created and calls `system_theme` immediately, but the effect
-/// could only be *applied* after the windows existed. So on a machine with
-/// transparency switched on, that first answer said `transparency: false`,
-/// the card painted itself opaque, and it stayed that way until the frontend's
-/// next 30-second poll. Worse, the "no window effect is active" warning is
-/// `Once`-guarded, so the log kept a complaint that had already stopped being
-/// true and never corrected it.
-///
-/// Deciding is pure: it needs the registry and the build number, not a window.
-/// Only attaching needs a window. So `setup` decides first, creates the
-/// windows, then attaches - and any `system_theme` in between already knows
-/// the right answer.
-pub fn decide_effect() {
-    let effect = choose_effect();
-    // Only ever set once, from setup. A second call would be a bug, not a
-    // reason to change what the frontend has already been told.
-    let _ = APPLIED.set(effect);
-}
-
-/// Put the decided compositor effect on both widget windows, or say why not.
-///
-/// Called from `setup` after the windows exist - `window-vibrancy` requires
-/// one. The effect is only ever applied when the user has transparency
-/// switched on; someone who turned it off did so deliberately, often for
-/// battery or motion reasons, and a widget is not the place to argue.
-pub fn apply_window_effects(app: &tauri::AppHandle) {
-    // Say what the widget is about to wear. Without this the only way to tell
-    // a correctly inherited palette from a fallback one is to hold the widget
-    // up against the taskbar and squint.
-    let theme = derive(read_raw());
-    log::line(&format!(
-        "system theme: {} card {} on a {} accent (surface {}, track {}, text {} / {})",
-        if theme.dark { "dark" } else { "light" },
-        theme.base,
-        theme.accent,
-        theme.surface,
-        theme.track,
-        theme.text,
-        theme.text_dim
-    ));
-
-    // `decide_effect` already ran and already logged why. Attaching to a
-    // window cannot change the answer, only fail to honour it.
-    attach_effect(app, applied_effect());
-}
-
-/// Which effect this machine should get. Pure: no window required.
-#[cfg(windows)]
-fn choose_effect() -> Effect {
-    let theme = derive(read_raw());
-
-    if !theme.transparency {
-        log::line(
-            "no window effect: EnableTransparency is 0, so the card stays opaque by the user's own setting",
-        );
-        return Effect::None;
-    }
-
-    let build = build_number();
-    match build {
-        Some(b) if b >= BUILD_WIN11 => Effect::Mica,
-        Some(b) if b >= BUILD_WIN10_1809 => Effect::Acrylic,
-        Some(b) => {
-            log::line(&format!(
-                "no window effect: Windows build {b} predates acrylic ({BUILD_WIN10_1809}); the card stays opaque"
-            ));
-            Effect::None
-        }
-        None => {
-            log::line("no window effect: could not read the Windows build number");
-            Effect::None
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn choose_effect() -> Effect {
-    log::line("no window effect: mica and acrylic are Windows-only");
-    Effect::None
-}
-
-/// Hang the already-decided effect on whichever windows exist.
-#[cfg(windows)]
-fn attach_effect(app: &tauri::AppHandle, wanted: Effect) {
-    use tauri::Manager;
-
-    if !wanted.is_active() {
-        return; // choose_effect already said why.
-    }
-
-    let theme = derive(read_raw());
-    let base = parse_hex(&theme.base).unwrap_or(DEFAULT_BASE);
-    // The card stops painting its own ground once the frontend sees
-    // `transparency: true`, so the backdrop has to supply the tint. The alpha
-    // is high enough that the text stays readable over a bright wallpaper.
-    let tint = (base.r, base.g, base.b, 0xb4u8);
-    let dark_backdrop = relative_luminance(base) < 0.5;
-
-    let mut applied_to = Vec::new();
-
-    for label in [crate::strip::LABEL, crate::popover::LABEL] {
-        // Perfectly normal for one to be absent: widget.mode decides which
-        // windows exist at all.
-        let Some(window) = app.get_webview_window(label) else {
-            continue;
-        };
-        let outcome = match wanted {
-            Effect::Mica => window_vibrancy::apply_mica(&window, Some(dark_backdrop)),
-            Effect::Acrylic => window_vibrancy::apply_acrylic(&window, Some(tint)),
-            Effect::None => unreachable!("guarded above"),
-        };
-        match outcome {
-            Ok(()) => applied_to.push(label),
-            Err(error) => log::line(&format!(
-                "could not apply {} to the {label} window: {error}",
-                wanted.name()
-            )),
-        }
-    }
-
-    if applied_to.is_empty() {
-        // The decision stands even though nothing took it. Flipping APPLIED
-        // back to None here would tell the frontend to paint an opaque card
-        // one poll later, which is a worse flicker than the one we just fixed.
-        log::line(
-            "window effect decided but no window accepted it; the card will look flat until restart",
-        );
-        return;
-    }
-
-    log::line(&format!(
-        "window effect: {} applied to {} (Windows build {})",
-        wanted.name(),
-        applied_to.join(" + "),
-        build_number().map_or_else(|| "unknown".to_string(), |b| b.to_string())
-    ));
-}
-
-#[cfg(not(windows))]
-fn attach_effect(_app: &tauri::AppHandle, _wanted: Effect) {}
-
-/// Parse `#rrggbb` back out of the palette. Only used to feed the acrylic
-/// tint, and only ever on a string this module produced.
+/// Parse `#rrggbb` back out of the palette, on a string this module produced.
+/// The palette leaves as hex and comes back as channels only here, where the
+/// tests check contrast against what the frontend was actually handed.
+#[cfg(test)]
 fn parse_hex(value: &str) -> Option<Rgb> {
     let digits = value.strip_prefix('#')?;
     if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -581,26 +399,9 @@ fn parse_hex(value: &str) -> Option<Rgb> {
 
 /* ------------------------------------------------------------ command -- */
 
-/// The palette as it stands right now, with `transparency` corrected to what
-/// the compositor is actually doing.
+/// The palette as it stands right now.
 pub fn current() -> SystemTheme {
-    let mut theme = derive(read_raw());
-
-    if theme.transparency && !applied_effect().is_active() {
-        // The user wants transparency and we could not give it to them.
-        // Saying `true` here would make the card stop painting its ground over
-        // a window with nothing behind it, which reads as a broken widget
-        // rather than as a missing effect.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            log::line(
-                "transparency is on in Windows but no window effect is active; reporting an opaque card",
-            );
-        });
-        theme.transparency = false;
-    }
-
-    theme
+    derive(read_raw())
 }
 
 /// Hand the frontend the Windows colour scheme.
@@ -647,11 +448,10 @@ fn report_delivery(theme: &SystemTheme) {
     }
 
     log::line(&format!(
-        "system_theme -> frontend: {} card {} on a {} accent, transparency {} (surface {}, track {}, text {} / {})",
+        "system_theme -> frontend: {} card {} on a {} accent (surface {}, track {}, text {} / {})",
         if theme.dark { "dark" } else { "light" },
         theme.base,
         theme.accent,
-        theme.transparency,
         theme.surface,
         theme.track,
         theme.text,
@@ -798,7 +598,6 @@ mod tests {
         // Exactly what the registry holds on the machine this was built for.
         let raw = RawTheme {
             apps_use_light_theme: Some(0),
-            enable_transparency: Some(0),
             accent_color: Some(MACHINE_ACCENT),
             accent_color_menu: Some(MACHINE_ACCENT),
             start_color_menu: Some(MACHINE_START),
@@ -807,8 +606,6 @@ mod tests {
         let theme = derive(raw);
 
         assert!(theme.dark);
-        // EnableTransparency is 0. The honest answer is no acrylic.
-        assert!(!theme.transparency);
         // The whole palette, pinned. If a future edit changes any of these the
         // widget stops matching the taskbar, and that is worth being told
         // about rather than discovering by eye.
@@ -855,9 +652,8 @@ mod tests {
         assert_eq!(theme.accent, DEFAULT_ACCENT.hex());
         assert_eq!(theme.base, DEFAULT_BASE.hex());
         assert_eq!(theme.surface, "#2c2a27");
-        // Dark-first design, and transparency off unless we know otherwise.
+        // Dark-first design unless we know otherwise.
         assert!(theme.dark);
-        assert!(!theme.transparency);
 
         let base = parse_hex(&theme.base).unwrap();
         assert!(contrast_ratio(parse_hex(&theme.text).unwrap(), base) >= TEXT_MIN_CONTRAST);
@@ -872,13 +668,11 @@ mod tests {
         // from the accent instead of from StartColorMenu.
         let raw = RawTheme {
             apps_use_light_theme: Some(1),
-            enable_transparency: Some(1),
             accent_color: Some(MACHINE_ACCENT),
             ..RawTheme::default()
         };
         let theme = derive(raw);
         assert!(!theme.dark);
-        assert!(theme.transparency, "derive reports the preference verbatim");
         assert_eq!(theme.accent, "#4c4a48");
         // #4c4a48 taken 34% toward black, which is roughly what Explorer
         // paints behind Start when ColorPrevalence is on.
@@ -893,7 +687,6 @@ mod tests {
         let json = serde_json::to_value(derive(RawTheme::default())).unwrap();
         for key in [
             "dark",
-            "transparency",
             "accent",
             "accentSoft",
             "base",
@@ -905,7 +698,6 @@ mod tests {
             assert!(json.get(key).is_some(), "missing {key} in {json}");
         }
         assert!(json["dark"].is_boolean());
-        assert!(json["transparency"].is_boolean());
     }
 
     #[test]
@@ -924,23 +716,13 @@ mod tests {
     }
 
     #[test]
-    fn transparency_is_withheld_until_an_effect_is_actually_applied() {
-        // `applied_effect` is None until apply_window_effects has run, so
-        // `current` must downgrade a preference it cannot honour. This is what
-        // keeps a failed acrylic from producing an invisible card.
-        assert_eq!(applied_effect(), Effect::None);
-        assert!(!current().transparency);
-    }
-
-    #[test]
-    fn the_effect_thresholds_are_the_documented_ones() {
-        // Mica needs Windows 11; this machine is 19045 and must get acrylic.
-        assert!(19_045 >= BUILD_WIN10_1809);
-        assert!(19_045 < BUILD_WIN11);
-        assert_eq!(Effect::Acrylic.name(), "acrylic");
-        assert_eq!(Effect::Mica.name(), "mica");
-        assert!(!Effect::None.is_active());
-        assert!(Effect::Acrylic.is_active());
+    fn the_payload_carries_no_transparency_switch() {
+        // The card always paints its own ground, because a compositor backdrop
+        // cannot be clipped to its rounded corners - see the effects section.
+        // A flag here is how the page would be told to stop painting, so the
+        // absence of one is the thing worth pinning.
+        let json = serde_json::to_value(derive(RawTheme::default())).unwrap();
+        assert!(json.get("transparency").is_none(), "no transparency switch: {json}");
     }
 
     #[test]
