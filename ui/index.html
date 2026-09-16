@@ -26,6 +26,17 @@
           <span class="panel-title">quota</span>
           <span class="panel-pin">pinned &middot; esc</span>
           <span class="panel-stamp" id="stamp"></span>
+          <!-- Read again, now. The figures come from files that other tools
+               write, so the newest thing on disk can be newer than the last
+               poll: the 60-second tick is a floor, not a promise, and someone
+               who just sat down wants the answer as of now.
+
+               A <button> rather than a styled span, so Enter and Space work
+               and the focus ring lands somewhere. It sits INSIDE the header's
+               drag region, which is why handleUnder below refuses to start a
+               drag on a control. -->
+          <button class="panel-refresh" id="refresh" type="button" aria-label="Refresh"
+                  title="Read the logs again now">&#x21bb;</button>
         </div>
         <!-- Sidecar warnings. The envelope carries them, and dropping them
              hides exactly the "this number is not what it looks like" notes
@@ -61,6 +72,7 @@
       const groupsEl = document.getElementById('groups');
       const warnEl = document.getElementById('warnings');
       const stampEl = document.getElementById('stamp');
+      const refreshEl = document.getElementById('refresh');
 
       const params = new URLSearchParams(location.search);
       /** The tray popover forces the panel open and never collapses. */
@@ -168,7 +180,20 @@
         };
       }
 
+      /**
+       * True while a read is in flight.
+       *
+       * The poll, the tray's Refresh and the button all call `load`, and a
+       * read shells out to the sidecar - so without this a press during the
+       * 60-second tick would run a second one, and the slower of the two would
+       * land last and could paint older figures over newer ones.
+       */
+      let loading = false;
+
       async function load() {
+        if (loading) return;
+        loading = true;
+        body.dataset.loading = 'true';
         try {
           // Browser preview: prefer a locally generated fixture, fall back to
           // the committed sanitised sample so a fresh clone renders too.
@@ -181,6 +206,9 @@
         } catch (err) {
           results = [{ ok: false, id: 'quota-monitor', error: String(err) }];
           warnings = [];
+        } finally {
+          loading = false;
+          body.dataset.loading = 'false';
         }
         paint();
       }
@@ -393,8 +421,14 @@
             });
         };
 
-        const handleUnder = (node) =>
-          node instanceof Element ? node.closest('[data-tauri-drag-region]') : null;
+        const handleUnder = (node) => {
+          if (!(node instanceof Element)) return null;
+          // The header is a drag handle and the refresh button lives in it.
+          // Without this the capture-phase `preventDefault` below eats the
+          // press, no click is ever synthesised, and the button is dead.
+          if (node.closest('button')) return null;
+          return node.closest('[data-tauri-drag-region]');
+        };
 
         const finish = (event, dx, dy) => {
           const press = drag;
@@ -428,6 +462,13 @@
               event.clientY > innerHeight);
           if (outside) collapseSoon();
         };
+
+        // The press still pins, as a press anywhere in the panel does: someone
+        // who asked for fresh figures is reading them, and a panel that
+        // collapsed out from under the pointer would be the wrong answer.
+        refreshEl.addEventListener('click', () => {
+          load();
+        });
 
         addEventListener(
           'pointerdown',
