@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -14,6 +14,7 @@ import {
   PROVIDER_ID,
   claudeCodeAdapter,
 } from './index.js';
+import { scanCachePath } from './scanCache.js';
 import { statusLineSnapshotPath, writeRateLimitSnapshot } from './statusline.js';
 import { MAX_LINE_LENGTH } from './transcripts.js';
 
@@ -1898,5 +1899,125 @@ describe('the rate the top-up is priced at', () => {
 
     expect(weekly.used).toBeCloseTo(60, 6);
     expect(weekly.note).toContain('priced against the 500.0K-token cap');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* the scan cache                                                             */
+/* -------------------------------------------------------------------------- */
+
+describe('reading a transcript only once', () => {
+  /**
+   * Rewrite a file's contents while keeping the size and mtime it had.
+   *
+   * No session does this - it is a forgery, and that is the point: if the next
+   * read reports the OLD numbers, it did not open the file, which is the only
+   * way to prove a cache hit from the outside.
+   */
+  async function forge(file: string, contents: string): Promise<void> {
+    const before = await stat(file);
+    await writeFile(file, contents, 'utf8');
+    const after = await stat(file);
+    if (after.size !== before.size) {
+      throw new Error(`forgery changed the size: ${before.size} -> ${after.size}`);
+    }
+    await utimes(file, before.atime, before.mtime);
+  }
+
+  it('replays a transcript whose size and mtime have not moved', async () => {
+    const dir = await makeClaudeDir();
+    const home = await makeHome();
+    const first = assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000 });
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [first]);
+
+    const before = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx),
+      'session',
+    );
+    expect(before.used).toBe(1000);
+
+    // Same length, different figure. A read that opened the file would see
+    // 9000; a read that trusted the cache sees 1000.
+    const forged = assistantLine(IN_SESSION, 'claude-opus-5', { input: 9000 });
+    expect(forged.length).toBe(first.length);
+    await forge(join(dir, 'projects', 'l--x', 'a.jsonl'), `${forged}\n`);
+
+    const after = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx),
+      'session',
+    );
+    expect(after.used).toBe(1000);
+  });
+
+  it('re-reads a transcript that grew', async () => {
+    const dir = await makeClaudeDir();
+    const home = await makeHome();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000 }),
+    ]);
+
+    await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx);
+
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1000 }),
+      assistantLine('2026-09-11T02:30:00.000Z', 'claude-opus-5', { input: 500 }),
+    ]);
+
+    const after = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx),
+      'session',
+    );
+    expect(after.used).toBe(1500);
+  });
+
+  it('says how much of the read came from the cache', async () => {
+    const dir = await makeClaudeDir();
+    const home = await makeHome();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 10 }),
+    ]);
+
+    const first = snapshotHarness(dir, home, { plan: 'max-20x' });
+    await claudeCodeAdapter.read(first.ctx);
+    expect(first.debug.some((line) => line.includes('0 of 1 transcript came from the scan cache'))).toBe(
+      true,
+    );
+
+    const second = snapshotHarness(dir, home, { plan: 'max-20x' });
+    await claudeCodeAdapter.read(second.ctx);
+    expect(second.debug.some((line) => line.includes('1 of 1 transcript came from the scan cache'))).toBe(
+      true,
+    );
+  });
+
+  it('writes no cache at all when it is switched off', async () => {
+    const dir = await makeClaudeDir();
+    const home = await makeHome();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 10 }),
+    ]);
+
+    const { ctx, debug } = snapshotHarness(dir, home, { plan: 'max-20x', scanCache: false });
+    await claudeCodeAdapter.read(ctx);
+
+    expect(debug.some((line) => line.includes('scan cache off'))).toBe(true);
+    await expect(readFile(scanCachePath(home), 'utf8')).rejects.toThrow();
+  });
+
+  it('is unbothered by a cache file it cannot read', async () => {
+    const dir = await makeClaudeDir();
+    const home = await makeHome();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine(IN_SESSION, 'claude-opus-5', { input: 1234 }),
+    ]);
+
+    await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx);
+    await writeFile(scanCachePath(home), '{ not json', 'utf8');
+
+    const after = byWindow(
+      await claudeCodeAdapter.read(snapshotHarness(dir, home, { plan: 'max-20x' }).ctx),
+      'session',
+    );
+    expect(after.used).toBe(1234);
   });
 });

@@ -108,6 +108,14 @@ import {
   newStreamStatus,
   streamLines,
 } from './transcripts.js';
+import {
+  type ScanCache,
+  emptyCache,
+  isFresh,
+  readScanCache,
+  scanCachePath,
+  writeScanCache,
+} from './scanCache.js';
 import { refreshFromUsage } from './usage.js';
 
 import type {
@@ -264,6 +272,15 @@ export interface ClaudeCodeOptions {
    * does.
    */
   usageProbe?: boolean;
+  /**
+   * Remember each transcript's parsed events between reads. Default true.
+   *
+   * Off means every read opens every transcript the windows could touch, which
+   * is what this used to do: a week of them is hundreds of megabytes, and the
+   * widget reads every 60 seconds. Worth turning off only to prove the cache is
+   * not the thing lying to you.
+   */
+  scanCache?: boolean;
   /** Transcripts opened in one read. Default 500. */
   maxFiles?: number;
 }
@@ -287,6 +304,7 @@ interface ResolvedOptions {
   weekly: ResolvedLimit;
   countCache: boolean;
   usageProbe: boolean;
+  scanCache: boolean;
   maxFiles: number;
 }
 
@@ -417,6 +435,7 @@ function resolveOptions(ctx: AdapterContext, detected: DetectedPlan): ResolvedOp
     weekly: resolveLimit(options, 'weeklyLimit', plan.weeklyTokens, ctx),
     countCache: optBoolean(options, 'countCache') ?? false,
     usageProbe: optBoolean(options, 'usageProbe') ?? true,
+    scanCache: optBoolean(options, 'scanCache') ?? true,
     maxFiles,
   };
 }
@@ -624,10 +643,16 @@ async function selectTranscripts(
 
 interface ScanRequest {
   files: readonly string[];
-  /** Events stamped outside `[fromMs, toMs)` are dropped as they are parsed. */
+  /** Events stamped outside `[fromMs, toMs)` are dropped before they are emitted. */
   fromMs: number;
   toMs: number;
   ctx: AdapterContext;
+  /**
+   * Parsed events from the last read, by file. Hit when the file's size and
+   * mtime are unchanged, which for an append-only transcript means its contents
+   * are too. Mutated in place: a miss replaces the entry.
+   */
+  cache: ScanCache | null;
   /**
    * Called with each de-duplicated batch of in-range events, at every file
    * boundary and whenever the pending buffer fills. Batches never overlap.
@@ -659,9 +684,20 @@ interface ScanRequest {
  * transcripts this was measured on - and memory stays flat in the number of
  * files.
  */
-async function scanTranscripts(req: ScanRequest): Promise<{ scanned: number; incomplete: number }> {
-  const { ctx, fromMs, toMs, onBatch } = req;
+/** One transcript's de-duplicated events, and whether we got all of them. */
+interface ParsedFile {
+  events: UsageEvent[];
+  complete: boolean;
+}
 
+/**
+ * Read one transcript.
+ *
+ * Everything in the file, not only what the current windows want: the result
+ * goes in the cache, and a later read with a wider window would otherwise be
+ * handed a truncated answer it has no way to recognise as truncated.
+ */
+async function parseOneFile(file: string, ctx: AdapterContext): Promise<ParsedFile> {
   /** In-window events awaiting a flush, keyed by API call. */
   const pending = new Map<string, UsageEvent>();
   /**
@@ -671,52 +707,100 @@ async function scanTranscripts(req: ScanRequest): Promise<{ scanned: number; inc
    */
   const unkeyed: UsageEvent[] = [];
 
-  const flush = (): void => {
-    if (pending.size === 0 && unkeyed.length === 0) return;
-    const batch = [...pending.values(), ...unkeyed];
-    pending.clear();
-    unkeyed.length = 0;
-    onBatch(batch);
+  const status = newStreamStatus();
+  try {
+    for await (const line of streamLines(file, status)) {
+      const event = parseLine(line);
+      if (event === null) continue;
+      if (!Number.isFinite(event.at.getTime())) continue;
+
+      const key = usageEventKey(event);
+      if (key === null) unkeyed.push(event);
+      else pending.set(key, event);
+    }
+  } catch (error) {
+    // One bad file must never cost us the whole reading.
+    ctx.debug(`${PROVIDER_ID}: skipped ${file} (${messageOf(error)})`);
+    status.complete = false;
+    if (status.reason === null) status.reason = messageOf(error);
+  }
+
+  if (!status.complete || status.oversizedLines > 0) {
+    ctx.debug(
+      `${PROVIDER_ID}: ${file} was not fully read ` +
+        `(${status.reason ?? `${status.oversizedLines} oversized lines dropped`})`,
+    );
+  }
+
+  return {
+    events: [...pending.values(), ...unkeyed],
+    complete: status.complete && status.oversizedLines === 0,
+  };
+}
+
+async function scanTranscripts(
+  req: ScanRequest,
+): Promise<{ scanned: number; incomplete: number; reused: number; cacheChanged: boolean }> {
+  const { ctx, fromMs, toMs, onBatch, cache } = req;
+
+  /** Hand the caller what it asked for: in range, in batches it can hold. */
+  const emit = (events: readonly UsageEvent[]): void => {
+    let batch: UsageEvent[] = [];
+    for (const event of events) {
+      const at = event.at.getTime();
+      if (!Number.isFinite(at) || at < fromMs || at >= toMs) continue;
+      batch.push(event);
+      if (batch.length >= MAX_PENDING_EVENTS) {
+        onBatch(batch);
+        batch = [];
+      }
+    }
+    if (batch.length > 0) onBatch(batch);
   };
 
   let scanned = 0;
   let incomplete = 0;
+  let reused = 0;
+  let cacheChanged = false;
 
   for (const file of req.files) {
     scanned += 1;
-    const status = newStreamStatus();
+
+    // One stat, which the cache check and the cache entry both need. A file
+    // that cannot be stat-ed is read the old way rather than skipped.
+    let size: number | null = null;
+    let mtimeMs: number | null = null;
     try {
-      for await (const line of streamLines(file, status)) {
-        const event = parseLine(line);
-        if (event === null) continue;
-
-        const at = event.at.getTime();
-        if (!Number.isFinite(at) || at < fromMs || at >= toMs) continue;
-
-        const key = usageEventKey(event);
-        if (key === null) unkeyed.push(event);
-        else pending.set(key, event);
-        if (pending.size + unkeyed.length >= MAX_PENDING_EVENTS) flush();
-      }
-    } catch (error) {
-      // One bad file must never cost us the whole reading.
-      ctx.debug(`${PROVIDER_ID}: skipped ${file} (${messageOf(error)})`);
-      status.complete = false;
-      if (status.reason === null) status.reason = messageOf(error);
+      const info = await stat(file);
+      size = info.size;
+      mtimeMs = info.mtimeMs;
+    } catch {
+      /* Unreadable stat: fall through to a full read. */
     }
 
-    flush();
-
-    if (!status.complete || status.oversizedLines > 0) {
-      incomplete += 1;
-      ctx.debug(
-        `${PROVIDER_ID}: ${file} was not fully read ` +
-          `(${status.reason ?? `${status.oversizedLines} oversized lines dropped`})`,
-      );
+    const entry = cache?.files.get(file);
+    if (size !== null && mtimeMs !== null && isFresh(entry, size, mtimeMs)) {
+      reused += 1;
+      emit(entry?.events ?? []);
+      continue;
     }
+
+    const parsed = await parseOneFile(file, ctx);
+    if (!parsed.complete) incomplete += 1;
+
+    // Only a complete read may be remembered. A file that could not be read to
+    // the end has to be tried again next time: the next attempt may get
+    // further, and a truncated answer that never retries is the kind of wrong
+    // that looks right.
+    if (cache !== null && parsed.complete && size !== null && mtimeMs !== null) {
+      cache.files.set(file, { size, mtimeMs, events: parsed.events });
+      cacheChanged = true;
+    }
+
+    emit(parsed.events);
   }
 
-  return { scanned, incomplete };
+  return { scanned, incomplete, reused, cacheChanged };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1613,6 +1697,15 @@ export const claudeCodeAdapter: QuotaAdapter = {
     const scanToMs = Math.max(weekly.end.getTime(), nowMs + sessionMs);
     const scanFrom = new Date(scanFromMs);
 
+    /*
+     * What the last read learned. A transcript whose size and mtime are
+     * unchanged is replayed from here rather than re-read, which is the
+     * difference between opening 389 MB of JSONL every 60 seconds and opening
+     * the two or three files a session has actually touched.
+     */
+    const cacheFile = scanCachePath(ctx.homeDir);
+    const cache = opts.scanCache ? await readScanCache(cacheFile, opts.claudeDir) : null;
+
     const selection = await selectTranscripts(opts.claudeDir, scanFrom, opts.maxFiles);
     if (selection.truncatedFrom !== null) {
       ctx.debug(
@@ -1674,6 +1767,7 @@ export const claudeCodeAdapter: QuotaAdapter = {
       fromMs: anchorFloorMs,
       toMs: scanToMs,
       ctx,
+      cache,
       onBatch: (batch) => {
         for (const acc of streamed) foldEvents(acc, batch);
         for (const event of batch) {
@@ -1690,6 +1784,15 @@ export const claudeCodeAdapter: QuotaAdapter = {
       incomplete: base.incomplete,
       truncatedFrom: selection.truncatedFrom,
     };
+
+    let cacheChanged = base.cacheChanged;
+    ctx.debug(
+      cache === null
+        ? `${PROVIDER_ID}: scan cache off (providers.${PROVIDER_ID}.scanCache), every transcript was read`
+        : `${PROVIDER_ID}: ${group(base.reused)} of ${group(base.scanned)} ` +
+            `${plural(base.scanned, 'transcript')} came from the scan cache, ` +
+            `${group(base.scanned - base.reused)} read from disk`,
+    );
 
     /*
      * The widening search.
@@ -1751,6 +1854,7 @@ export const claudeCodeAdapter: QuotaAdapter = {
           fromMs: anchorFloorMs,
           toMs: scanToMs,
           ctx,
+          cache,
           // Timestamps only. Nothing has been appended to these transcripts
           // since `scanFrom`, so every event in them predates the weekly
           // window and predates any window that could still be open: they can
@@ -1767,6 +1871,7 @@ export const claudeCodeAdapter: QuotaAdapter = {
 
         widenedFiles += widened.scanned;
         widenedIncomplete += widened.incomplete;
+        cacheChanged = cacheChanged || widened.cacheChanged;
         knownFromMs = floorMs;
         gap = findAnchorGap(anchorStamps, knownFromMs, sessionMs, nowMs);
 
@@ -1779,6 +1884,16 @@ export const claudeCodeAdapter: QuotaAdapter = {
               : `idle gap of ${span(gap.gapMs)} found at ${new Date(gap.fromMs).toISOString()}`),
         );
         if (gap !== null) break;
+      }
+    }
+
+    if (cache !== null && cacheChanged) {
+      const wrote = await writeScanCache(cacheFile, cache, now);
+      if (!wrote) {
+        ctx.debug(
+          `${PROVIDER_ID}: could not write the scan cache to ${cacheFile}; the next read will ` +
+            `open every transcript again`,
+        );
       }
     }
 
