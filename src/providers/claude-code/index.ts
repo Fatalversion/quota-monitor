@@ -253,6 +253,17 @@ export interface ClaudeCodeOptions {
   weeklyLimit?: number | null | string;
   /** Fold cache reads and cache writes into `used`. Default false. */
   countCache?: boolean;
+  /**
+   * Let a refresh run `claude -p "/usage"` to fetch Anthropic's own figures.
+   * Default true.
+   *
+   * It costs no quota (see `usage.ts`), but it does start a process, and a
+   * monitoring widget that spawns another tool is a thing someone may
+   * reasonably want to switch off. Off means refreshes read only what is on
+   * disk - the status line snapshot and the transcripts - exactly as the poll
+   * does.
+   */
+  usageProbe?: boolean;
   /** Transcripts opened in one read. Default 500. */
   maxFiles?: number;
 }
@@ -275,6 +286,7 @@ interface ResolvedOptions {
   session: ResolvedLimit;
   weekly: ResolvedLimit;
   countCache: boolean;
+  usageProbe: boolean;
   maxFiles: number;
 }
 
@@ -404,6 +416,7 @@ function resolveOptions(ctx: AdapterContext, detected: DetectedPlan): ResolvedOp
     session: resolveLimit(options, 'sessionLimit', plan.sessionTokens, ctx),
     weekly: resolveLimit(options, 'weeklyLimit', plan.weeklyTokens, ctx),
     countCache: optBoolean(options, 'countCache') ?? false,
+    usageProbe: optBoolean(options, 'usageProbe') ?? true,
     maxFiles,
   };
 }
@@ -1381,6 +1394,8 @@ function buildReportedReading(
     unit: 'percent',
     windowStart: acc.start === null ? null : acc.start.toISOString(),
     resetsAt: entry.resetsAt.toISOString(),
+    // When Anthropic last said something, not when we last looked.
+    observedAt: entry.observedAt.toISOString(),
     // 'reported' only while the figure is Anthropic's alone, carried here
     // verbatim from Claude Code's status line. The moment anything of ours is
     // added it is an estimate and has to be rendered as one.
@@ -1478,7 +1493,13 @@ export const claudeCodeAdapter: QuotaAdapter = {
     // in an IDE session, where no status line can ever fire, still moves the
     // bar. Best-effort by construction: no CLI, no answer or wording this does
     // not know leaves everything below exactly as it was.
-    if (ctx.refresh === true) {
+    if (ctx.refresh === true && !opts.usageProbe) {
+      ctx.debug(
+        `${PROVIDER_ID}: refresh asked for, but providers.${PROVIDER_ID}.usageProbe is off, so nothing was run`,
+      );
+    }
+
+    if (ctx.refresh === true && opts.usageProbe) {
       const probe = await refreshFromUsage(statusLineSnapshotPath(ctx.homeDir), now, {
         env: process.env,
         platform: process.platform,

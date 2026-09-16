@@ -183,6 +183,18 @@
       let loading = false;
 
       /**
+       * When figures last actually arrived, and whether the newest attempt
+       * failed.
+       *
+       * The header clock used to be set to `now` at the end of every paint,
+       * including the paints that happened because the sidecar had just
+       * failed - so a widget showing nothing but an error row still claimed to
+       * be up to date as of this minute.
+       */
+      let lastGoodAt = null;
+      let readFailed = false;
+
+      /**
        * Read the providers again.
        *
        * `refresh` asks each provider's own tool for a current figure as well -
@@ -203,7 +215,10 @@
                 .then((r) => (r.ok ? r.json() : Promise.reject(new Error('no local fixture'))))
                 .catch(() => fetch('./fixture.sample.json').then((r) => r.json()));
           ({ results, warnings } = unwrap(payload));
+          lastGoodAt = new Date();
+          readFailed = false;
         } catch (err) {
+          readFailed = true;
           results = [{ ok: false, id: 'quota-monitor', error: String(err) }];
           warnings = [];
         } finally {
@@ -250,10 +265,20 @@
           warnEl.hidden = true;
         }
 
-        stampEl.textContent = now.toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        });
+        const clock = (at) =>
+          at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        body.dataset.readFailed = readFailed ? 'true' : 'false';
+        if (!readFailed) {
+          stampEl.textContent = clock(now);
+          stampEl.title = 'When these figures were last read';
+        } else if (lastGoodAt !== null) {
+          stampEl.textContent = `${clock(lastGoodAt)} !`;
+          stampEl.title = 'The last read failed. This is when figures last arrived.';
+        } else {
+          stampEl.textContent = '--:--';
+          stampEl.title = 'No read has succeeded yet';
+        }
 
         // No footer. It carried an estimated spend figure and a provider
         // count; the spend was not wanted and the count was not worth a rule

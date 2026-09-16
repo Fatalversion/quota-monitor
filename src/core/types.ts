@@ -89,6 +89,17 @@ export interface QuotaReading {
   /** When the window rolls over, ISO 8601. null when not discoverable. */
   resetsAt: string | null;
   estimatedCostUsd?: number;
+  /**
+   * When the provider's figure was observed, ISO 8601. Absent when the reading
+   * is derived from local files, which are as current as the read itself.
+   *
+   * A reported percentage is a photograph: Anthropic's arrives when a status
+   * line or a `/usage` probe catches it, OpenAI's when Codex last wrote a
+   * rollout log. Without this a surface can only say when it last LOOKED, which
+   * is the question nobody is asking - "83%, as of nine hours ago" and "83%,
+   * just now" are different facts and were rendered identically.
+   */
+  observedAt?: string;
   confidence: Confidence;
   /** Shown in verbose output. Use it to explain a derived denominator. */
   note?: string;

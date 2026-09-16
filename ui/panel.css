@@ -332,6 +332,19 @@ body[data-loading="true"] .panel-refresh {
   }
 }
 
+/*
+ * The age of a provider's figure, carried at the end of the clock column. Dim
+ * on purpose: it is a caveat on the number beside it, not a number of its own.
+ */
+.reading-age {
+  color: var(--text-faint);
+}
+
+/* A read that failed. The clock keeps the last good time and says it is not now. */
+body[data-read-failed='true'] .panel-stamp {
+  color: var(--crit);
+}
+
 .panel-pin {
   display: none;
   letter-spacing: 0.06em;

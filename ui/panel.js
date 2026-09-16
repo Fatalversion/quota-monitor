@@ -132,6 +132,29 @@ export function formatUsd(n) {
  * Human gap between two instants, plus the direction, because a window that
  * already ended must never be shown as a countdown approaching zero.
  */
+/**
+ * How old a provider's figure may be before the row says so.
+ *
+ * Ten minutes, because under that the answer is "just now" and a row cluttered
+ * with an age nobody needed is worse than one without it. Over it, the
+ * difference between "83%, now" and "83%, this morning" is the whole story -
+ * Anthropic's figure only moves when a terminal session or a refresh catches
+ * it, and Codex's only when Codex next runs.
+ */
+export const STALE_FIGURE_MS = 10 * 60_000;
+
+/** "17h 46m", or null while the figure is current enough not to mention. */
+export function figureAge(observedAtIso, now) {
+  if (!observedAtIso) return null;
+  const then = new Date(observedAtIso).getTime();
+  if (!Number.isFinite(then)) return null;
+  // A figure stamped in the future is a clock that disagrees, not an age.
+  const ms = now.getTime() - then;
+  if (ms < STALE_FIGURE_MS) return null;
+  const gap = formatGap(observedAtIso, now);
+  return gap === null ? null : gap.text;
+}
+
 export function formatGap(fromIso, now) {
   if (!fromIso) return null;
   const then = new Date(fromIso).getTime();
@@ -229,6 +252,20 @@ function renderReading(reading, now) {
     meta.textContent = `resets in ${gap.text}`;
   } else {
     meta.textContent = 'no window';
+  }
+
+  /*
+   * When the provider last said this, when that is not recently.
+   *
+   * The panel's clock says when the widget last READ; this says when the
+   * figure was TRUE, and the two can be hours apart. Without it a stale
+   * reported percentage and a current one are the same pixels.
+   */
+  const age = figureAge(reading.observedAt, now);
+  if (age !== null) {
+    const stamp = el('span', 'reading-age', ` · ${age} old`);
+    stamp.title = `The provider reported this figure ${age} ago; it has not moved since`;
+    meta.append(stamp);
   }
   wrap.append(meta);
 
