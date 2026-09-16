@@ -1421,7 +1421,7 @@ function reported(
 }
 
 async function writeSnapshot(home: string, windows: RateLimitSnapshot['windows']): Promise<void> {
-  await writeRateLimitSnapshot(statusLineSnapshotPath(home), { writtenAt: NOW, windows });
+  await writeRateLimitSnapshot(statusLineSnapshotPath(home), { writtenAt: NOW, windows, models: {} });
 }
 
 describe('reported figures from the status line snapshot', () => {

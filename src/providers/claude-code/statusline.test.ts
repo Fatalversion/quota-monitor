@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   LIMIT_WINDOW_MS,
   MAX_HISTORY,
+  MAX_MODELS,
   MAX_PAYLOAD_BYTES,
   SNAPSHOT_KIND,
   SNAPSHOT_VERSION,
@@ -248,6 +249,7 @@ describe('mergeSnapshot', () => {
 describe('snapshot serialisation', () => {
   const snapshot: RateLimitSnapshot = {
     writtenAt: NOW,
+    models: {},
     windows: {
       five_hour: {
         usedPercentage: 18,
@@ -319,7 +321,7 @@ describe('the snapshot file', () => {
     const file = statusLineSnapshotPath(home);
     expect(await readRateLimitSnapshot(file)).toBeNull();
 
-    await writeRateLimitSnapshot(file, { writtenAt: NOW, windows: {} });
+    await writeRateLimitSnapshot(file, { writtenAt: NOW, windows: {}, models: {} });
     await writeFile(file, '{ truncated', 'utf8');
     expect(await readRateLimitSnapshot(file)).toBeNull();
 
@@ -465,6 +467,7 @@ describe('history: the figures a window used to carry', () => {
   it('survives the round trip to disk', () => {
     const snapshot: RateLimitSnapshot = {
       writtenAt: NOW,
+      models: {},
       windows: {
         seven_day: {
           usedPercentage: 50,
@@ -486,6 +489,7 @@ describe('history: the figures a window used to carry', () => {
   it('writes no history key at all while there is none', () => {
     const snapshot: RateLimitSnapshot = {
       writtenAt: NOW,
+      models: {},
       windows: {
         seven_day: {
           usedPercentage: 50,
@@ -550,5 +554,68 @@ describe('history: the figures a window used to carry', () => {
       { usedPercentage: 30, observedAt: new Date('2026-09-15T09:00:00.000Z') },
       { usedPercentage: 44, observedAt: new Date('2026-09-15T11:00:00.000Z') },
     ]);
+  });
+});
+
+describe('per-model weekly limits', () => {
+  const observed = (limits: string): ObservedLimits => parseStatusLinePayload(limits, NOW);
+  const model = (usedPercentage: number, resetsInMs: number) => ({
+    usedPercentage,
+    resetsAt: new Date(NOW.getTime() + resetsInMs),
+    clamped: false,
+  });
+
+  it('merges a model figure by the same rules as a window', () => {
+    const first = mergeSnapshot(null, observed(payload({})), NOW, { Fable: model(70, DAY) })
+      .snapshot;
+    expect(first.models['Fable']?.usedPercentage).toBe(70);
+
+    // Higher inside the same window wins and the old figure becomes history.
+    const raised = mergeSnapshot(first, {}, LATER, { Fable: model(76, DAY) }).snapshot;
+    expect(raised.models['Fable']?.usedPercentage).toBe(76);
+    expect(raised.models['Fable']?.history).toEqual([{ usedPercentage: 70, observedAt: NOW }]);
+
+    // Lower inside the same window is an older report, and changes nothing.
+    const stale = mergeSnapshot(raised, {}, LATER, { Fable: model(12, DAY) }).snapshot;
+    expect(stale.models['Fable']?.usedPercentage).toBe(76);
+  });
+
+  it('keeps a model the newest report did not mention', () => {
+    // /usage names the model you have been using. Dropping the others every
+    // probe would make their rows flicker in and out of the panel.
+    const first = mergeSnapshot(null, {}, NOW, { Fable: model(70, DAY), Opus: model(30, DAY) })
+      .snapshot;
+    const second = mergeSnapshot(first, {}, LATER, { Fable: model(71, DAY) }).snapshot;
+
+    expect(Object.keys(second.models).sort()).toEqual(['Fable', 'Opus']);
+    expect(second.models['Opus']?.usedPercentage).toBe(30);
+  });
+
+  it('caps how many it will remember, newest first', () => {
+    const many: Record<string, ReturnType<typeof model>> = {};
+    for (let i = 0; i < MAX_MODELS + 3; i += 1) many[`model-${i}`] = model(i, DAY);
+    const snapshot = mergeSnapshot(null, {}, NOW, many).snapshot;
+    expect(Object.keys(snapshot.models)).toHaveLength(MAX_MODELS);
+  });
+
+  it('survives the round trip, history and all', () => {
+    const snapshot = mergeSnapshot(
+      mergeSnapshot(null, {}, NOW, { Fable: model(70, DAY) }).snapshot,
+      {},
+      LATER,
+      { Fable: model(76, DAY) },
+    ).snapshot;
+
+    const back = parseSnapshot(serializeSnapshot(snapshot));
+    expect(back?.models['Fable']?.usedPercentage).toBe(76);
+    expect(back?.models['Fable']?.history).toEqual([{ usedPercentage: 70, observedAt: NOW }]);
+  });
+
+  it('writes no models key while there are none, and reads a file without one', () => {
+    const empty = mergeSnapshot(null, observed(payload({ five_hour: window(5, HOUR) })), NOW)
+      .snapshot;
+    const text = serializeSnapshot(empty);
+    expect(text).not.toContain('models');
+    expect(parseSnapshot(text)?.models).toEqual({});
   });
 });
