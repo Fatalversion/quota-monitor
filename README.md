@@ -152,12 +152,39 @@ One figure it shows and this tool does not model yet: a per-model weekly limit
 
 Researched and ruled out rather than forgotten:
 
-- **Devin** exposes consumption only to enterprise administrators. A full-power personal key returns 403.
+- **Devin (formerly Windsurf)** keeps its quota on the server. Checked on a Pro
+  account, 2026-09-16, with the app's own panel showing 73% of the week used:
+
+  - The IDE's cache (`%APPDATA%/devin/User/globalStorage/state.vscdb`, key
+    `windsurf.reactSettings.cachedPlanInfoData:<user>`) has exactly the right
+    shape - `dailyRemainingPercent`, `weeklyRemainingPercent`,
+    `overageBalanceMicros`, both reset timestamps - and is **not refreshed**:
+    the file was written minutes before it was read, while the record inside
+    said 100%/100% with reset timestamps a month old.
+  - The CLI's `user_status.*.bin` (a JSON envelope around base64 protobuf)
+    carries the account, the org and the model configs. Two captures a month
+    apart differ in **zero** fields; there is no quota in it.
+  - The CLI (`devin.exe`, "chisel") takes `-p/--print` like Claude Code, but
+    `/help` lists no usage command: `/status` is authentication,
+    `/session-stats` is this session's tokens, `/context` is the context
+    window. Logging the CLI in separately changes none of that.
+  - The CLI plainly KNOWS the figure - its interactive banner prints
+    "Pro · 27% remaining (resets in 3d 23h)" - and keeps it in memory. A
+    `user_status.*.bin` written by that very login carries the plan and its end
+    date and no percentage; the CLI's own logs carry none either.
+  - `~/.codeium` and `%APPDATA%/Windsurf` are the pre-rebrand install and stop
+    being written the day the machine moves to Devin.
+
+  So the figure the panel shows is fetched when the panel renders, and nothing
+  a local reader can see. Worth revisiting if Devin starts writing it down;
+  reading its API key out of the auth store to ask the server is not on the
+  table (see Honesty, below).
+
 - **Cursor** gives an individual subscriber no way to read either their usage or their cap.
 - **Gemini CLI** was retired for consumers in June 2026 and replaced by Antigravity CLI.
 
-Cline, OpenCode, Amp, Windsurf and GitHub Copilot all look feasible and are not
-built yet.
+Cline, OpenCode, Amp and GitHub Copilot all look feasible and are not built
+yet.
 
 ## Honesty
 
