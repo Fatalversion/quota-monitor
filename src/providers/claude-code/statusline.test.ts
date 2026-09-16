@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   LIMIT_WINDOW_MS,
+  MAX_HISTORY,
   MAX_PAYLOAD_BYTES,
   SNAPSHOT_KIND,
   SNAPSHOT_VERSION,
@@ -253,12 +254,14 @@ describe('snapshot serialisation', () => {
         resetsAt: new Date('2026-09-15T15:00:00.000Z'),
         observedAt: NOW,
         clamped: false,
+        history: [],
       },
       seven_day: {
         usedPercentage: 100,
         resetsAt: new Date('2026-09-20T12:00:00.000Z'),
         observedAt: new Date('2026-09-15T11:00:00.000Z'),
         clamped: true,
+        history: [],
       },
     },
   };
@@ -403,5 +406,149 @@ describe('the status line text', () => {
     expect(formatTimeLeft(45 * 60_000)).toBe('45m');
     expect(formatTimeLeft(LIMIT_WINDOW_MS.five_hour)).toBe('5h 00m');
     expect(formatTimeLeft(LIMIT_WINDOW_MS.seven_day)).toBe('7d 00h');
+  });
+});
+
+describe('history: the figures a window used to carry', () => {
+  const observed = (limits: string): ObservedLimits => parseStatusLinePayload(limits, NOW);
+
+  it('keeps the superseded figure, which is half of a measurable rate', () => {
+    const first = mergeSnapshot(null, observed(payload({ five_hour: window(30, 3 * HOUR) })), NOW)
+      .snapshot;
+    const raised = mergeSnapshot(first, observed(payload({ five_hour: window(38, 3 * HOUR) })), LATER)
+      .snapshot;
+
+    expect(raised.windows.five_hour?.usedPercentage).toBe(38);
+    expect(raised.windows.five_hour?.history).toEqual([{ usedPercentage: 30, observedAt: NOW }]);
+  });
+
+  it('keeps nothing from a window that has already reset', () => {
+    const first = mergeSnapshot(null, observed(payload({ five_hour: window(30, HOUR) })), NOW)
+      .snapshot;
+    // A later reset is a different window: what the old one charged says
+    // nothing about the new one.
+    const next = mergeSnapshot(first, observed(payload({ five_hour: window(4, 5 * HOUR) })), LATER)
+      .snapshot;
+
+    expect(next.windows.five_hour?.usedPercentage).toBe(4);
+    expect(next.windows.five_hour?.history).toEqual([]);
+  });
+
+  it('does not record an idle session repeating an older figure', () => {
+    const first = mergeSnapshot(null, observed(payload({ five_hour: window(45, 3 * HOUR) })), NOW)
+      .snapshot;
+    const stale = mergeSnapshot(first, observed(payload({ five_hour: window(12, 3 * HOUR) })), LATER)
+      .snapshot;
+
+    expect(stale.windows.five_hour?.history).toEqual([]);
+  });
+
+  it('keeps the newest MAX_HISTORY and drops the oldest', () => {
+    let snapshot = mergeSnapshot(null, observed(payload({ seven_day: window(1, DAY) })), NOW)
+      .snapshot;
+    for (let step = 2; step <= MAX_HISTORY + 4; step += 1) {
+      snapshot = mergeSnapshot(
+        snapshot,
+        observed(payload({ seven_day: window(step, DAY) })),
+        new Date(NOW.getTime() + step * 60_000),
+      ).snapshot;
+    }
+
+    const history = snapshot.windows.seven_day?.history ?? [];
+    expect(history).toHaveLength(MAX_HISTORY);
+    // The current figure is MAX_HISTORY + 4; the kept history ends just below
+    // it and starts as late as the cap allows.
+    expect(history[history.length - 1]?.usedPercentage).toBe(MAX_HISTORY + 3);
+    expect(history[0]?.usedPercentage).toBe(4);
+  });
+
+  it('survives the round trip to disk', () => {
+    const snapshot: RateLimitSnapshot = {
+      writtenAt: NOW,
+      windows: {
+        seven_day: {
+          usedPercentage: 50,
+          resetsAt: new Date('2026-09-20T12:00:00.000Z'),
+          observedAt: NOW,
+          clamped: false,
+          history: [
+            { usedPercentage: 30, observedAt: new Date('2026-09-15T09:00:00.000Z') },
+            { usedPercentage: 44, observedAt: new Date('2026-09-15T11:00:00.000Z') },
+          ],
+        },
+      },
+    };
+
+    const back = parseSnapshot(serializeSnapshot(snapshot));
+    expect(back?.windows.seven_day?.history).toEqual(snapshot.windows.seven_day?.history);
+  });
+
+  it('writes no history key at all while there is none', () => {
+    const snapshot: RateLimitSnapshot = {
+      writtenAt: NOW,
+      windows: {
+        seven_day: {
+          usedPercentage: 50,
+          resetsAt: new Date('2026-09-20T12:00:00.000Z'),
+          observedAt: NOW,
+          clamped: false,
+          history: [],
+        },
+      },
+    };
+
+    expect(serializeSnapshot(snapshot)).not.toContain('history');
+  });
+
+  it('reads a file written before history existed as a window with none', () => {
+    const text = JSON.stringify({
+      tool: 'quota-monitor',
+      kind: 'claude-code-rate-limits',
+      version: 1,
+      writtenAt: NOW.toISOString(),
+      windows: {
+        seven_day: {
+          usedPercentage: 50,
+          resetsAt: '2026-09-20T12:00:00.000Z',
+          observedAt: NOW.toISOString(),
+          clamped: false,
+        },
+      },
+    });
+
+    expect(parseSnapshot(text)?.windows.seven_day?.history).toEqual([]);
+  });
+
+  it('drops a malformed entry, and one stamped at or after the figure it belongs to', () => {
+    const text = JSON.stringify({
+      tool: 'quota-monitor',
+      kind: 'claude-code-rate-limits',
+      version: 1,
+      writtenAt: NOW.toISOString(),
+      windows: {
+        seven_day: {
+          usedPercentage: 50,
+          resetsAt: '2026-09-20T12:00:00.000Z',
+          observedAt: NOW.toISOString(),
+          clamped: false,
+          history: [
+            { usedPercentage: 'thirty', observedAt: '2026-09-15T09:00:00.000Z' },
+            { usedPercentage: 30, observedAt: 'never' },
+            // Later than the current figure: it cannot be something this
+            // window used to say.
+            { usedPercentage: 30, observedAt: '2026-09-15T13:00:00.000Z' },
+            { usedPercentage: 44, observedAt: '2026-09-15T11:00:00.000Z' },
+            { usedPercentage: 30, observedAt: '2026-09-15T09:00:00.000Z' },
+          ],
+        },
+      },
+    });
+
+    // Sorted on the way in, because several sessions write this file and only
+    // the instants are authoritative.
+    expect(parseSnapshot(text)?.windows.seven_day?.history).toEqual([
+      { usedPercentage: 30, observedAt: new Date('2026-09-15T09:00:00.000Z') },
+      { usedPercentage: 44, observedAt: new Date('2026-09-15T11:00:00.000Z') },
+    ]);
   });
 });

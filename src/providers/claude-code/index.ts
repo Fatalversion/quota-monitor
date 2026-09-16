@@ -1086,6 +1086,11 @@ function statusLineNotePart(
   );
 }
 
+/** A measured rate as a human reads it: "3.4%" per million tokens. */
+function pointsPerMillion(rate: Calibration): string {
+  return formatPercent(rate.pointsPerToken * 1_000_000);
+}
+
 /** Calls stamped after `sinceMs`, from the timestamps the scan collected. */
 function callsAfter(stamps: readonly number[], sinceMs: number, nowMs: number): number {
   let count = 0;
@@ -1133,11 +1138,6 @@ function buildReportedNote(
   // The figure cannot include a call made after it was recorded, and those
   // calls are sitting in the transcripts. Counting them turns "this might be
   // stale" into a statement of how stale.
-  const capFrom =
-    topUp === null || topUp.limit.source === 'config'
-      ? `your config (providers.${PROVIDER_ID}.${acc.limit.key})`
-      : `the COMMUNITY ESTIMATE for "${opts.plan.label}" in src/providers/${PROVIDER_ID}/plans.ts`;
-
   if (topUp !== null) {
     // The shown figure is two numbers with different pedigrees, and a reader
     // has to be able to take them apart.
@@ -1145,11 +1145,30 @@ function buildReportedNote(
       `TOPPED UP: the figure last changed ${age} and cannot include what came after it, so ` +
         `this row adds an estimate of ${formatPercent(topUp.points)} for the ` +
         `${group(topUp.calls)} Claude Code ${plural(topUp.calls, 'call')} recorded on this ` +
-        `machine since - ${compact(topUp.tokens)} tokens against the ${compact(topUp.limit.value ?? 0)}-token ` +
-        `cap from ${capFrom}; the anchor is ` +
-        `Anthropic's and the addition is ours, which is why the whole figure is marked as an ` +
-        `estimate, and it snaps back to their number the next time a session with the status ` +
-        `line gets a response`,
+        `machine since (${compact(topUp.tokens)} tokens)`,
+    );
+
+    parts.push(
+      topUp.basis.kind === 'measured'
+        ? // The rate came out of Anthropic's own two figures, so it carries
+          // whatever they actually charge for - model weighting, cache, all of
+          // it - without this tool having to know the formula.
+          `priced at ${pointsPerMillion(topUp.basis.rate)} per million tokens, MEASURED from ` +
+            `Anthropic's own figures: they added ${formatPercent(topUp.basis.rate.points)} over the ` +
+            `${compact(topUp.basis.rate.tokens)} tokens recorded between ` +
+            `${topUp.basis.rate.from.toISOString()} and ${entry.observedAt.toISOString()}`
+        : `priced against the ${compact(topUp.basis.limit.value ?? 0)}-token cap from ` +
+            `${topUp.basis.limit.source === 'config' ? `your config (providers.${PROVIDER_ID}.${acc.limit.key})` : `the COMMUNITY ESTIMATE for "${opts.plan.label}" in src/providers/${PROVIDER_ID}/plans.ts`} - ` +
+            `a constant, so it is only right while your mix of models is; two reported figures in ` +
+            `one window replace it with a rate measured from them`,
+    );
+
+    parts.push(
+      `treat it as a FLOOR: the addition counts this machine only, and usage on the same plan ` +
+        `from a phone, the web app or another machine raises the real figure without appearing ` +
+        `here; the anchor is Anthropic's and the addition is ours, which is why the whole ` +
+        `figure is marked as an estimate, and it snaps back to their number the next time a ` +
+        `session with the status line gets a response`,
     );
   } else if (since > 0) {
     // Calls after the figure, but no cap to price them against.
@@ -1209,6 +1228,79 @@ function buildReportedNote(
  * AFTER it is added, so nothing is double-counted and the estimate collapses
  * back to Anthropic's own number the moment a status line speaks again.
  */
+/**
+ * Smallest rise worth measuring a rate from.
+ *
+ * Anthropic reports whole-ish percentages, so a one-point rise could be
+ * anything from 0.5 to 1.5 points of real usage - a 3x error in the rate. Two
+ * points halves that, and a pair too small to use simply widens to an older
+ * one.
+ */
+const MIN_CALIBRATION_POINTS = 2;
+
+/**
+ * Smallest amount of local work worth dividing by.
+ *
+ * The rate is points per LOCAL token, and usage on the same plan from a phone,
+ * the web app or another machine lands in the numerator while contributing
+ * nothing to the denominator. Over a big enough interval that is a mild bias;
+ * over a tiny one - two points charged against 800 local tokens because the
+ * real work happened elsewhere - it is a rate that would put a working hour
+ * past 100%.
+ */
+const MIN_CALIBRATION_TOKENS = 20_000;
+
+/** A pair of reported figures, and what Anthropic charged between them. */
+interface Calibration {
+  /** The older figure's instant. */
+  from: Date;
+  /** Points Anthropic added between the two. */
+  points: number;
+  /** Local tokens recorded in the same interval. */
+  tokens: number;
+  /** points / tokens. The whole object exists to produce this. */
+  pointsPerToken: number;
+}
+
+/**
+ * The most recent pair of reported figures worth measuring a rate from, or null.
+ *
+ * Walks back from the newest superseded figure, because the newest pair
+ * describes the models in use NOW - which is the entire point. The first pair
+ * with a big enough rise wins; if none is big enough, the widest pair with any
+ * rise at all is better than nothing.
+ */
+export function calibrationSpan(entry: SnapshotWindow): { from: Date; points: number } | null {
+  const history = [...entry.history].sort(
+    (a, b) => a.observedAt.getTime() - b.observedAt.getTime(),
+  );
+
+  let widest: { from: Date; points: number } | null = null;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const seen = history[i];
+    if (seen === undefined) continue;
+    const points = entry.usedPercentage - seen.usedPercentage;
+    if (points <= 0) continue;
+    if (points >= MIN_CALIBRATION_POINTS) return { from: seen.observedAt, points };
+    widest = { from: seen.observedAt, points };
+  }
+  return widest;
+}
+
+/** The measured rate, or null when the interval cannot carry one. */
+function calibrationFrom(
+  span: { from: Date; points: number } | null,
+  between: WindowAccumulator | null,
+  opts: ResolvedOptions,
+): Calibration | null {
+  if (span === null || between === null) return null;
+
+  const tokens = usedTokens(totalsOf(between).tokens, opts.countCache);
+  if (tokens < MIN_CALIBRATION_TOKENS) return null;
+
+  return { from: span.from, points: span.points, tokens, pointsPerToken: span.points / tokens };
+}
+
 interface TopUp {
   /** Percentage points to add to the reported figure. */
   points: number;
@@ -1216,33 +1308,47 @@ interface TopUp {
   tokens: number;
   /** Calls those tokens came from. */
   calls: number;
-  /** The cap they were divided by, and where it came from. */
-  limit: ResolvedLimit;
+  /** What turned those tokens into points. */
+  basis: { kind: 'measured'; rate: Calibration } | { kind: 'cap'; limit: ResolvedLimit };
 }
 
 /**
  * The top-up, or null when there is nothing honest to add.
  *
- * Null in three cases, each of which leaves the reading as Anthropic stated it:
- * nothing was recorded after the figure; the plan has no token cap for this
- * window, so there is no denominator; or the cap is not a positive number.
+ * Two ways to price the tokens, and the measured one wins whenever it exists:
+ *
+ *   MEASURED - Anthropic's own figures say what they charged for a known
+ *   quantity of this user's work, so the rate needs no cap, no plan table and
+ *   no configuration, and it follows a change of model by itself.
+ *
+ *   CAP - the configured or plan-table token ceiling, which is a constant and
+ *   therefore wrong whenever the mix moves. Kept as the fallback for the case
+ *   the measurement cannot cover: one reported figure and no second one yet.
+ *
+ * Null when neither is available, or when nothing was recorded after the
+ * figure - and then the reading stays exactly as Anthropic stated it.
  */
 function topUpFor(
   since: WindowAccumulator | null,
   limit: ResolvedLimit,
   opts: ResolvedOptions,
+  rate: Calibration | null,
 ): TopUp | null {
   if (since === null || since.calls === 0) return null;
-  if (limit.value === null || !(limit.value > 0)) return null;
 
   const tokens = usedTokens(totalsOf(since).tokens, opts.countCache);
   if (tokens <= 0) return null;
 
+  if (rate !== null) {
+    return { points: tokens * rate.pointsPerToken, tokens, calls: since.calls, basis: { kind: 'measured', rate } };
+  }
+
+  if (limit.value === null || !(limit.value > 0)) return null;
   return {
     points: (tokens / limit.value) * PERCENT_LIMIT,
     tokens,
     calls: since.calls,
-    limit,
+    basis: { kind: 'cap', limit },
   };
 }
 
@@ -1255,9 +1361,10 @@ function buildReportedReading(
   stamps: readonly number[],
   nowMs: number,
   since: WindowAccumulator | null,
+  rate: Calibration | null,
 ): QuotaReading {
   const totals = totalsOf(acc);
-  const topUp = topUpFor(since, acc.limit, opts);
+  const topUp = topUpFor(since, acc.limit, opts, rate);
 
   const reading: QuotaReading = {
     provider: PROVIDER_ID,
@@ -1411,6 +1518,23 @@ export const claudeCodeAdapter: QuotaAdapter = {
             opts.weekly,
           );
     if (weeklySince !== null) streamed.push(weeklySince);
+
+    // And the interval BETWEEN the last two reported figures, which is what
+    // prices the tokens above. Same shape again: one more interval, one more
+    // fold per batch.
+    const weeklySpan = reportedWeekly === null ? null : calibrationSpan(reportedWeekly);
+    const weeklyBetween =
+      weeklySpan === null || reportedWeekly === null
+        ? null
+        : makeAccumulator(
+            'weekly',
+            {
+              start: new Date(weeklySpan.from.getTime() + REPORTED_ACTIVITY_GRACE_MS),
+              end: new Date(reportedWeekly.observedAt.getTime() + REPORTED_ACTIVITY_GRACE_MS),
+            },
+            opts.weekly,
+          );
+    if (weeklyBetween !== null) streamed.push(weeklyBetween);
 
     const sessionMs = Math.round(opts.sessionHours * MS_PER_HOUR);
     const ladder = anchorLadderMs(sessionMs);
@@ -1636,6 +1760,20 @@ export const claudeCodeAdapter: QuotaAdapter = {
           );
     if (sessionSince !== null) foldEvents(sessionSince, sessionCandidates);
 
+    const sessionSpan = reportedSession === null ? null : calibrationSpan(reportedSession);
+    const sessionBetween =
+      sessionSpan === null || reportedSession === null
+        ? null
+        : makeAccumulator(
+            'session',
+            {
+              start: new Date(sessionSpan.from.getTime() + REPORTED_ACTIVITY_GRACE_MS),
+              end: new Date(reportedSession.observedAt.getTime() + REPORTED_ACTIVITY_GRACE_MS),
+            },
+            opts.session,
+          );
+    if (sessionBetween !== null) foldEvents(sessionBetween, sessionCandidates);
+
     /*
      * What is left to doubt?
      *
@@ -1697,6 +1835,7 @@ export const claudeCodeAdapter: QuotaAdapter = {
             anchorStamps,
             nowMs,
             sessionSince,
+            calibrationFrom(sessionSpan, sessionBetween, opts),
           );
 
     const weeklyReading =
@@ -1711,6 +1850,7 @@ export const claudeCodeAdapter: QuotaAdapter = {
             anchorStamps,
             nowMs,
             weeklySince,
+            calibrationFrom(weeklySpan, weeklyBetween, opts),
           );
 
     return [sessionReading, weeklyReading];
