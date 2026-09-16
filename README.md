@@ -112,9 +112,41 @@ mislead:
   Code reports the new window, and says so.
 - **One account per home directory.** Nothing in the payload identifies the
   account, so switching Claude accounts on one machine mixes their figures.
-- **IDE extensions.** Claude Code's documentation describes the status line for
-  the terminal and does not say whether IDE extensions run the command. If the
-  file above never appears, run `claude` in a terminal once.
+- **IDE extensions never run it.** Status lines are a terminal feature: an IDE
+  session, a print-mode run (`claude -p`) and a headless SDK session fire no
+  status line at all, so a day's work in the VS Code extension moves nothing
+  here. That is what `--refresh` below is for.
+
+## Asking for a figure now
+
+```bash
+quota --refresh
+```
+
+The widget does this for you when it starts and when you press the refresh
+control in the panel header, or Refresh in the tray menu. The 60-second poll
+does not: it reads what is on disk.
+
+A refresh runs `claude -p "/usage"` and records the figures it prints, through
+the same rules the status line goes through. That covers the two cases local
+files cannot: an IDE session, which fires no status line, and usage on your
+phone, on claude.ai or on another machine, which never touches this computer at
+all.
+
+**It spends no quota.** `/usage` is answered inside Claude Code rather than by
+a model. Measured on the machine this was written on: zero tokens, zero dollars,
+`num_turns: 0`, about a second. No credential is read and no network call is
+made from this tool - your own CLI is already signed in, and we read what it
+prints.
+
+If Claude Code is not installed, not signed in, or prints something this does
+not recognise, the refresh changes nothing and the widget carries on with the
+status line snapshot and its own estimate. Nothing of the report is kept but the
+percentages and their reset times - `/usage` also prints a breakdown naming
+your sessions, subagents and MCP servers, and none of that is stored or logged.
+
+One figure it shows and this tool does not model yet: a per-model weekly limit
+("Current week (Fable)"), alongside the session and all-models windows.
 
 ### Not supported, and why
 

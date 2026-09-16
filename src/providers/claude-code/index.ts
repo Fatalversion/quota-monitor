@@ -108,6 +108,7 @@ import {
   newStreamStatus,
   streamLines,
 } from './transcripts.js';
+import { refreshFromUsage } from './usage.js';
 
 import type {
   AdapterContext,
@@ -1470,6 +1471,39 @@ export const claudeCodeAdapter: QuotaAdapter = {
     const opts = resolveOptions(ctx, detected);
     const now = ctx.now();
     const nowMs = now.getTime();
+
+    // A person asked, so ask Anthropic. `/usage` answers with the figures a
+    // status line would have carried, costs no quota (measured: zero tokens,
+    // zero dollars, one second), and lands in the same snapshot - so a refresh
+    // in an IDE session, where no status line can ever fire, still moves the
+    // bar. Best-effort by construction: no CLI, no answer or wording this does
+    // not know leaves everything below exactly as it was.
+    if (ctx.refresh === true) {
+      const probe = await refreshFromUsage(statusLineSnapshotPath(ctx.homeDir), now, {
+        env: process.env,
+        platform: process.platform,
+        homeDir: ctx.homeDir,
+      });
+      ctx.debug(
+        probe.reason !== null
+          ? `${PROVIDER_ID}: asked "claude -p /usage" and got nothing usable (${probe.reason}); the snapshot stands`
+          : `${PROVIDER_ID}: "claude -p /usage" reported ` +
+              [
+                probe.report?.session === null
+                  ? null
+                  : `5-hour ${formatPercent(probe.report?.session?.usedPercentage ?? 0)}`,
+                probe.report?.week === null
+                  ? null
+                  : `7-day ${formatPercent(probe.report?.week?.usedPercentage ?? 0)}`,
+                probe.report?.perModel == null
+                  ? null
+                  : `${probe.report.perModel.model} ${formatPercent(probe.report.perModel.usedPercentage)} (not recorded: no window for a per-model limit)`,
+              ]
+                .filter((part) => part !== null)
+                .join(', ') +
+              `${probe.wrote ? '' : '; nothing on disk changed'}`,
+      );
+    }
 
     // Anthropic's own figures, when the status line recorder has any. Read
     // BEFORE the scan: a reported window brings its own bounds, and the scan

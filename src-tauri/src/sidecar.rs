@@ -49,9 +49,12 @@ use tauri::{AppHandle, Manager};
 
 use crate::log;
 
-/// Kill the child after this long. A quota read scans transcript files, so it
-/// is not instant, but half a minute means something is wrong.
-const TIMEOUT: Duration = Duration::from_secs(30);
+/// Kill the child after this long. A quota read scans transcript files, and a
+/// refresh additionally runs `claude -p /usage` - measured at 1-5 seconds, but
+/// it is a second node process starting while this one reads a week of
+/// transcripts, and the CLI gives that its own 20-second bound. A minute leaves
+/// room for both without ever being the thing that decides.
+const TIMEOUT: Duration = Duration::from_secs(60);
 /// How often to check whether the child is done.
 const POLL: Duration = Duration::from_millis(25);
 /// Refuse to buffer more than this from the child. The real payload is a few
@@ -69,8 +72,12 @@ pub const REPO_ENV_VAR: &str = "QUOTA_MONITOR_REPO";
 static ANNOUNCED: Mutex<Option<String>> = Mutex::new(None);
 
 /// Run the CLI and return its parsed JSON envelope.
-pub fn read_quota(app: &AppHandle) -> Result<Value, String> {
-    let launcher = match resolve(app) {
+///
+/// `refresh` is what a person pressing Refresh means, and it is passed
+/// straight through to the CLI: ask each provider's own tool for a current
+/// figure rather than reading only what is on disk. A poll never sets it.
+pub fn read_quota(app: &AppHandle, refresh: bool) -> Result<Value, String> {
+    let launcher = match resolve(app, refresh) {
         Ok(launcher) => launcher,
         Err(error) => {
             log::line(&error);
@@ -251,15 +258,20 @@ fn announce(launcher: &Launcher) {
 }
 
 /// Find the first runnable quota CLI, or explain everywhere we looked.
-fn resolve(app: &AppHandle) -> Result<Launcher, String> {
+fn resolve(app: &AppHandle, refresh: bool) -> Result<Launcher, String> {
     let mut tried: Vec<String> = Vec::new();
+    // Every launcher below ends with the same pair, so the flag is built once.
+    let mut tail: Vec<OsString> = vec![OsString::from("--json")];
+    if refresh {
+        tail.push(OsString::from("--refresh"));
+    }
 
     for path in bundled_candidates(app) {
         if path.is_file() {
             return Ok(Launcher {
                 label: "the bundled quota sidecar".to_string(),
                 program: path,
-                args: vec![OsString::from("--json")],
+                args: tail,
                 cwd: None,
             });
         }
@@ -280,7 +292,7 @@ fn resolve(app: &AppHandle) -> Result<Launcher, String> {
                 return Ok(Launcher {
                     label: "the compiled quota CLI".to_string(),
                     program: node,
-                    args: vec![built.into_os_string(), OsString::from("--json")],
+                    args: [vec![built.into_os_string()], tail].concat(),
                     cwd: Some(root),
                 })
             }
@@ -297,12 +309,15 @@ fn resolve(app: &AppHandle) -> Result<Launcher, String> {
                 return Ok(Launcher {
                     label: "the quota CLI source via tsx".to_string(),
                     program: npx,
-                    args: vec![
-                        OsString::from("--no-install"),
-                        OsString::from("tsx"),
-                        source.into_os_string(),
-                        OsString::from("--json"),
-                    ],
+                    args: [
+                        vec![
+                            OsString::from("--no-install"),
+                            OsString::from("tsx"),
+                            source.into_os_string(),
+                        ],
+                        tail,
+                    ]
+                    .concat(),
                     cwd: Some(root),
                 })
             }
