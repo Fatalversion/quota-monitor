@@ -27,21 +27,17 @@ serde_json = "1"
 # only: reading widget.mode out of the same config file the CLI reads.
 serde_yaml_ng = "0.10"
 
-# The system theme is a Windows question, so its three dependencies are too.
-# All three are already in the tree as transitive dependencies of tauri, so
-# naming them here adds no download and no new code to audit.
+# The system theme is a Windows question, so its dependency is too. It is
+# already in the tree as a transitive dependency of tauri, so naming it here
+# adds no download and no new code to audit.
 [target.'cfg(windows)'.dependencies]
-# Read-only HKCU access for the accent, the dark-mode flag and
-# EnableTransparency. Only `open_subkey_with_flags(.., KEY_READ)` is ever used;
-# nothing in this crate opens a key for writing.
+# Read-only HKCU access for the accent and the dark-mode flag. Only
+# `open_subkey_with_flags(.., KEY_READ)` is ever used; nothing in this crate
+# opens a key for writing.
+#
+# No window-vibrancy and no windows-version: the widget applies no mica and no
+# acrylic at all, and theme.rs's effects section records why.
 winreg = "0.55"
-# Mica and acrylic. Doing this by hand means DwmSetWindowAttribute and the
-# undocumented SetWindowCompositionAttribute, with a different path per build;
-# this crate is the tauri team's own and already handles that split.
-window-vibrancy = "0.6"
-# RtlGetVersion, to tell Windows 11 (mica) from Windows 10 (acrylic). The
-# registry's CurrentBuildNumber lies under compatibility shims; this does not.
-windows-version = "0.1"
 
 [features]
 # The asset protocol that serves ../ui out of the binary. Kept in `default` so
