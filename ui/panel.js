@@ -29,65 +29,60 @@ const CRIT_AT = 90;
  * Each entry returns an SVG string drawn on a 24x24 grid in `currentColor`.
  */
 const MARKS = {
-  // Claude: the radiating burst, eight tapered rays.
+  /*
+   * Each provider's OWN mark, shipped as the vendor published it.
+   *
+   * These files are not ours and are not covered by this project's licence -
+   * see TRADEMARKS.md and the notice in ui/icons/. They are used the way each
+   * brand's guidelines describe: unmodified, at their own colours, to identify
+   * whose usage a row is reporting, and never as this project's own identity.
+   * GitHub's wording is the clearest of the four and covers all of them: "Use a
+   * permitted GitHub logo to inform others that your project integrates with
+   * GitHub."
+   *
+   * Unmodified is the load-bearing word. They are drawn from a file rather than
+   * inlined so nothing here can tint, stretch or recolour them by accident: the
+   * badge colour underneath is ours, the mark on top is theirs. Where a brand
+   * ships a variant for dark backgrounds and one for light, the chip is chosen
+   * to suit the variant, not the other way round.
+   */
   'claude-code': {
     title: 'Claude Code',
-    svg: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <g transform="translate(12 12)">
-        <g id="r"><path d="M0-9.2 1.5-2.6 0 0-1.5-2.6Z"/></g>
-        <use href="#r" transform="rotate(45)"/><use href="#r" transform="rotate(90)"/>
-        <use href="#r" transform="rotate(135)"/><use href="#r" transform="rotate(180)"/>
-        <use href="#r" transform="rotate(225)"/><use href="#r" transform="rotate(270)"/>
-        <use href="#r" transform="rotate(315)"/>
-      </g></svg>`,
+    // The clay burst, on a light chip. Anthropic's own file is #D97757.
+    file: 'claude-code.svg',
   },
-  /*
-   * Codex: the six-fold rosette of the OpenAI mark, built as three rounded
-   * capsules at 60 degrees.
-   *
-   * The real mark is one continuous interlocking ribbon. This is an homage to
-   * its silhouette, not a trace of it, for the licence reason above and for a
-   * practical one: at 22px the ribbon's overlaps collapse into mush, whereas
-   * the rosette still reads. A terminal chevron sat here first, which was
-   * legible but said "some CLI" rather than "Codex".
-   */
   codex: {
-    title: 'Codex',
-    svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-       stroke-width="1.7" aria-hidden="true">
-      <g transform="translate(12 12)">
-        <rect x="-3.3" y="-8.2" width="6.6" height="16.4" rx="3.3"/>
-        <rect x="-3.3" y="-8.2" width="6.6" height="16.4" rx="3.3" transform="rotate(60)"/>
-        <rect x="-3.3" y="-8.2" width="6.6" height="16.4" rx="3.3" transform="rotate(120)"/>
-      </g></svg>`,
+    title: 'OpenAI Codex',
+    // The white Blossom, which needs the dark chip under it.
+    file: 'codex.svg',
   },
-  // Copilot: a rounded visor.
   copilot: {
     title: 'GitHub Copilot',
-    svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-       stroke-linecap="round" aria-hidden="true">
-      <path d="M3.5 13.5c0-3 3.8-5 8.5-5s8.5 2 8.5 5v2.2c0 1.9-3.8 3.3-8.5 3.3s-8.5-1.4-8.5-3.3z"/>
-      <path d="M12 8.5V6a2 2 0 0 1 2-2h1.2"/><path d="M9 13.8v1.6"/><path d="M15 13.8v1.6"/></svg>`,
+    // The Invertocat, white. NOT the standalone Copilot face: GitHub
+    // deprecated that in 2025, and their current identity for the product is
+    // the Invertocat with a wordmark - which cannot be read at 22px, so the
+    // mark goes in the badge and the word goes in the row label beside it.
+    file: 'copilot.svg',
   },
-  // Cursor: a pointer.
   cursor: {
     title: 'Cursor',
-    svg: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M5 3.2 18.6 11l-5.6 1.4L10.4 18z"/></svg>`,
+    // The square avatar Cursor draws for dark grounds. Their SVGs are the
+    // cube alone in a 466x532 canvas - portrait, and mostly empty - which is
+    // what put it off-centre in a square badge. The avatar is square by
+    // construction and is the asset they publish for exactly this use.
+    file: 'cursor.png',
   },
-  // Devin: a simple bot head.
   devin: {
     title: 'Devin',
-    svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <rect x="4" y="7.5" width="16" height="12" rx="3.5"/><path d="M12 7.5V4"/>
-      <path d="M9 13h.01"/><path d="M15 13h.01"/></svg>`,
+    // Cognition's square avatar, which carries its own white ground - so it
+    // fills the badge rather than sitting on a chip of ours.
+    file: 'devin.svg',
   },
 };
 
 export function badgeFor(id) {
   const mark = MARKS[id];
-  if (mark) return { svg: mark.svg, title: mark.title, known: true };
+  if (mark) return { file: mark.file, title: mark.title, known: true };
   // Unknown provider: initials, so a community adapter still gets a badge.
   return { text: (id || '?').slice(0, 2).toUpperCase(), title: id, known: false };
 }
@@ -201,10 +196,15 @@ function makeBadge(id) {
   const node = el('span', 'badge');
   node.dataset.provider = mark.known ? id : 'unknown';
   node.title = mark.title;
-  if (mark.svg) {
-    // Static markup we author in this file. No provider data reaches here, so
-    // there is nothing user-controlled to inject.
-    node.innerHTML = mark.svg;
+  if (mark.file) {
+    // An <img>, not inline markup: the vendors' files carry their own ids and
+    // clip paths, and five of them inlined into one document would collide.
+    // It also makes recolouring one by accident impossible, which is a term of
+    // using them at all.
+    const img = el('img', 'mark');
+    img.src = `icons/${mark.file}`;
+    img.alt = '';
+    node.append(img);
   } else {
     node.textContent = mark.text;
   }

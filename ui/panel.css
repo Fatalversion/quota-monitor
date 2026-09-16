@@ -177,29 +177,100 @@ body[data-dock="bottom"] .card {
   line-height: 1;
   color: #ffffff;
   background: var(--accent);
+  /*
+   * Clip to the rounded corners. Two marks arrive as square avatars carrying
+   * their own ground, and without this they painted their square straight over
+   * the badge's radius - pointed corners in a row of rounded ones. It also
+   * keeps a mark that is scaled past 100% inside the chip it belongs to,
+   * rather than spilling onto the card behind it.
+   */
+  overflow: hidden;
 }
 
-.badge > svg {
+/*
+ * The chip each mark sits on.
+ *
+ * The marks themselves are the vendors' own files and are never touched - so
+ * the only decision left here is what goes UNDER them, and that is decided by
+ * which variant each brand ships. A white mark needs a dark chip; a dark one
+ * needs a light chip. Getting that backwards would be a mark you cannot see,
+ * which is the one thing worse than an approximation.
+ *
+ * The rest of the widget still inherits the Windows accent (see theme.rs), and
+ * the bars still do: escalation is carried by a bar filling up, and that has to
+ * look identical for every provider or comparing them stops working.
+ */
+/*
+ * Claude: the white asterisk on the clay, which is how Anthropic dresses it
+ * themselves. The mark is their monochrome variant - the one published with
+ * fill="currentColor", a colour slot meant to be filled - and the clay is
+ * theirs too, #D97757, read out of their colour file.
+ */
+.badge[data-provider='claude-code'] {
+  background: #d97757;
+}
+
+.badge[data-provider='codex'] {
+  background: #000000;
+}
+
+.badge[data-provider='copilot'] {
+  background: #24292f;
+}
+
+/*
+ * Two of them are avatars carrying their own ground, so they ARE the chip. A
+ * colour behind one would only ever show as a rim.
+ */
+.badge[data-provider='cursor'],
+.badge[data-provider='devin'] {
+  background: transparent;
+}
+
+/*
+ * An adapter this build has never heard of gets initials on the widget's own
+ * surface. Quiet on purpose: a row we can describe but not identify.
+ */
+.badge[data-provider='unknown'] {
+  background: var(--surface);
+  color: var(--text-dim);
+}
+
+/*
+ * Sized per mark, because "68% of the badge" means different things to a burst
+ * that fills its viewBox and a blossom that does not. Contain, never cover:
+ * cropping someone's logo is modifying it.
+ */
+.badge > .mark {
   width: 68%;
   height: 68%;
   display: block;
+  object-fit: contain;
 }
 
-.badge[data-provider="codex"] {
-  background: var(--badge-dim);
-  color: #23211f;
-  font-size: 10px;
+/*
+ * OpenAI's Blossom is drawn inside a 716 canvas and fills about half of it, so
+ * 74% of the badge put roughly 37% on screen - which is why it read small
+ * beside marks that fill their own viewBox. The file is untouched; the box it
+ * is given is bigger.
+ */
+.badge[data-provider='codex'] > .mark {
+  width: 112%;
+  height: 112%;
 }
 
-.badge[data-provider="codex"] > svg {
+.badge[data-provider='copilot'] > .mark {
   width: 76%;
   height: 76%;
 }
 
-.badge[data-provider="unknown"] {
-  background: var(--surface);
-  color: var(--text-dim);
+/* Both arrive as square avatars with their own ground: they fill the badge. */
+.badge[data-provider='cursor'] > .mark,
+.badge[data-provider='devin'] > .mark {
+  width: 100%;
+  height: 100%;
 }
+
 
 /* A bar is a bar in every mode; only the axis changes. */
 .bar {

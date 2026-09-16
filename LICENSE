@@ -2,6 +2,13 @@ MIT License
 
 Copyright (c) 2026 The quota-monitor contributors
 
+EXCEPT for the files in ui/icons/, which are third-party trademarks - each
+vendor's own logo, copied unmodified from the brand pack they publish. They are
+NOT licensed under the terms below and are not the contributors' to sublicense.
+They are included to identify the services this tool measures. See
+TRADEMARKS.md and ui/icons/NOTICE.md; a fork inherits those obligations, not a
+grant.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
