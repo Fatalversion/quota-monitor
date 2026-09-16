@@ -795,7 +795,16 @@ body[data-mode="rail"] .rail {
  * identifies the provider rather than either window. Two 9px bars and a 10px
  * gap fit the rail's 56px of usable width with room to spare.
  */
-.rail[data-mode='single'] {
+/*
+ * Gated on the BODY's mode, not just the rail's own.
+ *
+ * `.rail` is display:none until `body[data-mode="rail"]` switches it on, and a
+ * bare `.rail[data-mode=...]` rule that sets display overrides that - so the
+ * rail drew itself in every mode, stray badges over the horizontal dock and
+ * vertical bars across the expanded panel. Three layouts share one DOM here;
+ * anything that turns one on has to say which mode it belongs to.
+ */
+body[data-mode='rail'] .rail[data-mode='single'] {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -810,11 +819,19 @@ body[data-mode="rail"] .rail {
   min-height: 0;
 }
 
+/*
+ * Each window is a column that must FILL the rail, not sit at its natural
+ * height. `.rail .bar` is height:100% with min-height:80px, written for a grid
+ * row that gave it a height; in this flex column the parent is auto, so 100%
+ * resolved to nothing and the 80px floor took over - leaving slack below the
+ * numbers that read as lopsided padding rather than a short bar.
+ */
 .rail-window {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
+  flex: 1 1 auto;
   min-height: 0;
 }
 
@@ -828,6 +845,10 @@ body[data-mode="rail"] .rail {
 
 .rail[data-mode='single'] .bar {
   width: 9px;
+  /* Grow into whatever the column has, rather than stopping at the floor. */
+  height: auto;
+  min-height: 0;
+  flex: 1 1 auto;
 }
 
 /*
@@ -838,7 +859,7 @@ body[data-mode="rail"] .rail {
  * stops being columns and becomes rows, and the number carries the colour, the
  * same answer the dock reaches for the same reason.
  */
-.rail[data-mode='compact'] {
+body[data-mode='rail'] .rail[data-mode='compact'] {
   display: flex;
   flex-direction: column;
   align-items: stretch;
@@ -933,8 +954,21 @@ body[data-mode="bar"] .dock {
   min-width: 0;
 }
 
+/*
+ * 96px, and the number is arithmetic rather than taste.
+ *
+ * The collapsed dock is a FIXED 300x44 window (strip.rs, BAR) with
+ * overflow: hidden, so anything wider than it is simply cut off - which is
+ * what 116px did: two items of 22 + 9 + 116 came to 346px inside a 300px
+ * window and the bars ran off the card.
+ *
+ * 300 less 32 of padding is 268; less the 14px gap between two items leaves
+ * 254, so 127 each; less the badge and its 9px gap leaves 96. A third
+ * provider does not fit at any bar width, which is why three or more stops
+ * drawing bars at all.
+ */
 .dock-item .bar {
-  width: 116px;
+  width: 96px;
   height: 7px;
 }
 
@@ -966,7 +1000,9 @@ body[data-mode="bar"] .dock {
  * about the week.
  */
 .dock-solo .dock-stack {
-  gap: 5px;
+  /* Two lines inside a 44px window: 2 x 11 plus this gap, and the card still
+     wants its own padding either side. */
+  gap: 4px;
 }
 
 .dock-line {
@@ -986,6 +1022,11 @@ body[data-mode="bar"] .dock {
   min-width: 18px;
 }
 
+/*
+ * One provider has the whole 268px to itself: 22 badge + 9 gap + 18 label +
+ * 7 + bar + 7 + 30 for the number leaves 175. 150 keeps a margin for a
+ * three-character label like "30d".
+ */
 .dock-solo .dock-line .bar {
   width: 150px;
   height: 6px;
