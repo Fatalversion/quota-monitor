@@ -11,13 +11,19 @@ nothing held back for a pro version.
 
 ```
 ✳  Claude Code                    Max 20x
-   Session    resets in 2h 31m        18%
-   Weekly     resets in 2d 14h        94%
+   Session    resets in 4h 17m         7%
+   Weekly     resets in 4d 14h        85%
+   Weekly · Fable                     76%
 
-⬡  Codex                             Plus
-   Session    ended 3d 19h ago         0%
-   Weekly     resets in 2d 23h         0%
+⬡  Codex                              Pro
+   Weekly     resets in 4d 15h        80%
+   Weekly · GPT-5.3-Codex-Spark        0%
 ```
+
+Those are real figures, and they match what each tool reports about itself to
+the digit. The per-model rows are limits that apply to one model rather than
+the whole plan - on a Max plan that is frequently the one that stops the work
+first, and it is the row a subscription dashboard tends not to show you.
 
 Hover the dock to expand it, click to pin it open, drag it to any screen edge.
 It also lives in the system tray.
@@ -29,7 +35,7 @@ It also lives in the system tray.
 | Provider | Setup | Figures are |
 | --- | --- | --- |
 | **Codex CLI** | None | Reported by OpenAI |
-| **Claude Code** | None for spend, [one settings entry](#claude-code-percentages) for percentages | Reported by Anthropic once set up, derived otherwise |
+| **Claude Code** | None | Reported by Anthropic |
 
 Both read files the tool already writes to your disk, or data it hands to a
 command you configured. Nothing is uploaded and no credential is used.
@@ -41,17 +47,27 @@ next run Codex, and the widget says how stale the snapshot is rather than
 presenting an old figure as live.
 
 **Claude Code is the harder case.** The transcripts record every token spent, so
-the numerator is real. Nothing on disk records the cap. Claude Code's own
-`/usage` knows it, but it fetches that from Anthropic's servers using the OAuth
-token in your credentials file, and reading another tool's stored credential is
-a line this project does not cross.
+the numerator is real. Nothing on disk records the cap.
 
-There is one sanctioned way in. Claude Code hands its **status line** command a
-JSON payload that carries Anthropic's own `used_percentage` and reset time for
-the 5-hour and 7-day windows. Point your status line at `quota statusline` and
-those rows become reported figures, exactly like Codex. Without that you get
-real token counts and no percentage, or a percentage you
-[calibrated](#calibration) yourself.
+There are two ways to the figure itself, and the widget uses both.
+
+**Asking.** `claude -p "/usage"` prints Anthropic's own percentages, and it
+costs nothing: `/usage` is answered inside Claude Code rather than by a model -
+measured at zero tokens, zero dollars, `num_turns: 0`, about a second. The
+widget runs that when you press refresh and when it starts. Note what it is NOT
+doing: it does not read your credentials file, or call Anthropic itself. It
+asks the CLI you are already signed into, and reads what that prints. Reading
+another tool's stored token is a line this project does not cross.
+
+**Being told.** Claude Code hands its **status line** command a JSON payload
+carrying the same percentages on every response. Point your status line at
+`quota statusline` and the figures refresh as you work, with nothing to press.
+Worth doing if you live in a terminal; unnecessary otherwise, and it does
+nothing at all for IDE sessions, which never run a status line.
+
+Between those two, the estimate carries the bar - and it is priced at a rate
+measured from your own account rather than a constant. See
+[Calibration](#calibration).
 
 ## Claude Code percentages
 
@@ -204,31 +220,42 @@ cap in `plans.ts` is now `null` and the comment there records why.
 
 ## Calibration
 
-The fallback, for when the [status line](#claude-code-percentages) is not an
-option. To get percentages for Claude Code without it, give it a denominator
-you measured.
+Anthropic publishes no token cap, and there is no honest constant to ship: a
+week of mixed models and a day of 1M-context Opus were measured 4.5x apart on
+one machine in one week. So the cap is measured rather than assumed, and you do
+not have to do anything for it.
 
-1. Run `/usage` in Claude Code and note the session and weekly percentages.
-2. Run `quota --json` at the same moment and note `used` for each window.
-3. Divide, and put the results in your config.
+**How it works.** Two reported percentages and the transcripts between them say
+what one of your tokens costs against a window. On a real account:
 
-Worked example. Say `/usage` reports 13% and 90%, and at that moment
-`quota --json` reports 520,000 tokens in the session window and 5,400,000 in
-the week:
+```
+priced at 23.2% per million tokens, MEASURED from Anthropic's own figures:
+they added 27% over the 1.2M tokens recorded between 13:05 and 07:44
+```
+
+A hundred points of that is the cap - about 4.3M tokens there. It is stored, so
+it survives the window reset that clears the evidence, and it is re-measured
+whenever two fresh figures allow. Between reported figures the same rate tops
+the last one up with the calls made since, which is what keeps the bar moving
+in an IDE session where no status line ever fires.
+
+**What it will not do.** It will not price local work against a rate it has not
+got: with no measurement and no configured cap, the row shows raw spend and no
+bar, because a wrong percentage is worse than none. It will not count anything
+but this machine, so treat a topped-up figure as a floor - usage from a phone,
+claude.ai or another computer raises the real number without appearing here.
+And it will not override you:
 
 ```yaml
 providers:
   claude-code:
-    sessionLimit: 4000000    # 520,000 / 0.13
-    weeklyLimit: 6000000     # 5,400,000 / 0.90
+    sessionLimit: 5460000    # a number you measured yourself
+    weeklyLimit: 7926000
 ```
 
-Sanity check: the session cap should come out below the weekly one. Percentages
-stay marked as derived, because one calibration point fixes a ratio and not a
-law. Delete both lines to go back to raw numbers with no bar.
-
-`/usage` also shows a per-model limit that this tool does not model at all. That
-ceiling can bite while both bars here still look calm.
+A configured cap always wins. If you set one months ago and your mix of models
+has moved on, delete it and let the measurement take over - that is now the
+better number, not the worse one.
 
 ## Configuration
 
@@ -249,9 +276,21 @@ alerts:
 providers:
   claude-code:
     enabled: true
+    usageProbe: true    # let a refresh run `claude -p /usage`
+    scanCache: true     # remember each transcript's parsed events between reads
   codex:
     enabled: true
+    rateLimitProbe: true    # let a refresh ask Codex's app-server for its limits
 ```
+
+The two probes cost no quota and about a second each, but they do start a
+process - set either to `false` if you would rather a monitoring widget never
+did that, and refreshes will read only what is on disk.
+
+`scanCache` is the difference between opening a week of transcripts on every
+poll and opening the two or three a session has touched; on one machine that is
+389 MB versus almost nothing, every 60 seconds. Turn it off only to prove it is
+not the thing lying to you.
 
 Note that `enabled` stops the adapter reading at all. To simply hide a provider
 from the widget while still tracking it, untick it in the tray menu.
@@ -259,17 +298,49 @@ from the widget while still tracking it, untick it in the tray menu.
 Credentials are never stored here. When API-based providers arrive they will use
 the OS keychain, and the config parser actively rejects an inline secret.
 
+## Installing
+
+Windows, today. macOS and Linux build from source but are untested.
+
+1. Build the installer - `npm ci && npm run build:installer` - or take one from
+   a release. It produces both an `.exe` (NSIS) and an `.msi`; either will do,
+   and the NSIS one installs per-user with no administrator prompt.
+2. Run it. The widget appears as a thin rail on the right-hand edge of your
+   screen and as a tray icon.
+3. There is no sign-in and no configuration step. It looks for the tools you
+   already have: if Claude Code or Codex is installed, their rows appear on the
+   first read.
+
+Living with it:
+
+- **Hover** the rail to expand it, **click** to pin it open, **drag** it to any
+  screen edge - left and right give the upright rail, top and bottom the
+  horizontal bar. It remembers where you put it.
+- **↻ in the panel header**, or **Refresh** in the tray menu, asks each tool for
+  a current figure rather than re-reading what is on disk. The app also does
+  this once at startup; the 60-second poll deliberately does not.
+- **The tray menu** hides individual providers, which stops them being drawn
+  without stopping them being read.
+- Files live in `~/.config/quota-monitor/`: `config.yaml`, and beside it the
+  figures the tool has recorded and its scan cache. Deleting any of them costs
+  nothing but a re-read.
+
+To start it with Windows, put a shortcut to the installed `quota-monitor.exe`
+in `shell:startup`. The app does not write to your registry or install a
+service to do this for you.
+
 ## Building
 
 Needs Node 20+ and, for the desktop widget, the Rust toolchain.
 
 ```bash
-npm install
-npm test              # 741 tests
-npm run dev           # the CLI, prints a readout
-npm run dev -- --json # machine-readable
+npm ci
+npm test               # 831 tests
+npm run dev            # the CLI, prints a readout
+npm run dev -- --json  # machine-readable
+npm run dev -- --refresh --verbose   # ask the tools, and say what was asked
 
-cd src-tauri && cargo test    # 93 tests
+cd src-tauri && cargo test    # 92 tests
 cargo build && ./target/debug/quota-monitor
 ```
 
@@ -285,7 +356,9 @@ fixture with no toolchain at all.
 - Read `~/.claude/.credentials.json`, `~/.codex/auth.json`, or any other tool's stored token. Not even though it is local, easy, and would remove the last bit of setup.
 - Send telemetry, analytics or crash reports. There is nothing to opt out of.
 - Write to another tool's files, or make any network call from the desktop shell. That includes Claude Code's settings: you add the status line entry yourself.
-- Spend quota to measure quota.
+- Spend quota to measure quota. The two probes run the vendor's own CLI and are
+  free by measurement, not by assumption: zero tokens, zero cost, no session
+  created.
 - Scrape a provider's web interface, drive it with browser automation, or read session cookies.
 - Grow a paid tier, a licence key, or an upsell.
 
