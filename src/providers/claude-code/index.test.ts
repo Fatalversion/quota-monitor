@@ -1402,12 +1402,21 @@ function snapshotHarness(
   return { debug: base.debug, ctx: { ...base.ctx, homeDir: home } };
 }
 
-function reported(usedPercentage: number, resetsAt: string, observedAt: string) {
+function reported(
+  usedPercentage: number,
+  resetsAt: string,
+  observedAt: string,
+  history: readonly { usedPercentage: number; observedAt: string }[] = [],
+) {
   return {
     usedPercentage,
     resetsAt: new Date(resetsAt),
     observedAt: new Date(observedAt),
     clamped: false,
+    history: history.map((seen) => ({
+      usedPercentage: seen.usedPercentage,
+      observedAt: new Date(seen.observedAt),
+    })),
   };
 }
 
@@ -1734,5 +1743,160 @@ describe('topping a reported figure up with the usage it cannot include', () => 
     expect(weekly.confidence).toBe('reported');
     expect(weekly.note).toContain('BEHIND');
     expect(weekly.note).toContain('providers.claude-code.weeklyLimit');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* pricing the top-up from Anthropic's own two figures                        */
+/* -------------------------------------------------------------------------- */
+
+describe('the rate the top-up is priced at', () => {
+  const RESETS = '2026-09-15T12:00:00.000Z';
+
+  it("measures it from the last two reported figures rather than from a cap", async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      // Between the two figures: 100K tokens bought 10 points, so one point
+      // costs 10K tokens whatever mix of models produced them.
+      assistantLine('2026-09-11T00:30:00.000Z', 'claude-opus-5', { input: 100_000 }),
+      // After the second figure: 50K tokens, which at that rate is 5 points.
+      assistantLine('2026-09-11T02:00:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(50, RESETS, '2026-09-11T01:00:00.000Z', [
+        { usedPercentage: 40, observedAt: '2026-09-11T00:00:00.000Z' },
+      ]),
+    });
+
+    // A cap that would give a very different answer: 50K of 500K is 10 points,
+    // not 5. The measured rate has to win.
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 500_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    expect(weekly.used).toBeCloseTo(55, 6);
+    expect(weekly.confidence).toBe('derived');
+    expect(weekly.note).toContain('MEASURED');
+    expect(weekly.note).toContain('they added 10% over the 100.0K tokens recorded between');
+    // The addition is local-only, and the row has to say so.
+    expect(weekly.note).toContain('FLOOR');
+  });
+
+  it('falls back to the cap when too little local work sits between the two figures', async () => {
+    // 10K tokens is under the floor: an interval that thin is mostly a
+    // measurement of what happened on someone's phone.
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T00:30:00.000Z', 'claude-opus-5', { input: 10_000 }),
+      assistantLine('2026-09-11T02:00:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(50, RESETS, '2026-09-11T01:00:00.000Z', [
+        { usedPercentage: 40, observedAt: '2026-09-11T00:00:00.000Z' },
+      ]),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 500_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    // 50K of the 500K cap: ten points, the old arithmetic.
+    expect(weekly.used).toBeCloseTo(60, 6);
+    expect(weekly.note).toContain('priced against the 500.0K-token cap');
+    expect(weekly.note).toContain('a constant, so it is only right while your mix of models is');
+  });
+
+  it('prices from the newest usable pair, not the oldest', async () => {
+    // The oldest pair spans a cheap stretch (40 points for 2M tokens); the
+    // newest spans an expensive one (2 points for 40K). Anything that reached
+    // for the widest span would price this work at a fifth of what it costs.
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-10T21:00:00.000Z', 'claude-sonnet-4-5', { input: 2_000_000 }),
+      assistantLine('2026-09-11T00:45:00.000Z', 'claude-opus-5', { input: 40_000 }),
+      assistantLine('2026-09-11T02:00:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(50, RESETS, '2026-09-11T01:00:00.000Z', [
+        { usedPercentage: 10, observedAt: '2026-09-10T20:00:00.000Z' },
+        { usedPercentage: 44, observedAt: '2026-09-11T00:00:00.000Z' },
+        { usedPercentage: 48, observedAt: '2026-09-11T00:30:00.000Z' },
+      ]),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 500_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    // 2 points per 40K tokens, so 50K tokens is 2.5 points.
+    expect(weekly.used).toBeCloseTo(52.5, 6);
+    expect(weekly.note).toContain('2026-09-11T00:30:00.000Z');
+  });
+
+  it('widens to an older pair when the newest rise is too small to measure', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T00:30:00.000Z', 'claude-opus-5', { input: 100_000 }),
+      assistantLine('2026-09-11T02:00:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      // Half a point apart: under the floor, and the only pair there is.
+      seven_day: reported(50, RESETS, '2026-09-11T01:00:00.000Z', [
+        { usedPercentage: 49.5, observedAt: '2026-09-11T00:00:00.000Z' },
+      ]),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 500_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    // 0.5 points per 100K tokens, so 50K is a quarter of a point.
+    expect(weekly.used).toBeCloseTo(50.25, 6);
+    expect(weekly.note).toContain('MEASURED');
+  });
+
+  it('measures the five-hour window from its own pair', async () => {
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T01:30:00.000Z', 'claude-opus-5', { input: 60_000 }),
+      assistantLine('2026-09-11T02:30:00.000Z', 'claude-opus-5', { input: 30_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      five_hour: reported(20, '2026-09-11T06:00:00.000Z', '2026-09-11T02:00:00.000Z', [
+        { usedPercentage: 14, observedAt: '2026-09-11T01:00:00.000Z' },
+      ]),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', sessionLimit: 1_000_000 });
+    const session = byWindow(await claudeCodeAdapter.read(ctx), 'session');
+
+    // 6 points per 60K tokens, so 30K is 3 points on top of 20.
+    expect(session.used).toBeCloseTo(23, 6);
+    expect(session.note).toContain('MEASURED');
+  });
+
+  it('ignores history from a window that has since reset', async () => {
+    // The pair belongs to the window before this one. `mergeSnapshot` clears
+    // history on a reset, so a file carrying both is one this tool did not
+    // write - and the adapter still must not price today's work with
+    // yesterday's rate. Nothing usable means the cap, not a guess.
+    const dir = await makeClaudeDir();
+    await writeTranscript(dir, 'l--x', 'a.jsonl', [
+      assistantLine('2026-09-11T02:00:00.000Z', 'claude-opus-5', { input: 50_000 }),
+    ]);
+    const home = await makeHome();
+    await writeSnapshot(home, {
+      seven_day: reported(50, RESETS, '2026-09-11T01:00:00.000Z', [
+        // Higher than the current figure: only a reset explains it.
+        { usedPercentage: 80, observedAt: '2026-09-11T00:00:00.000Z' },
+      ]),
+    });
+
+    const { ctx } = snapshotHarness(dir, home, { plan: 'max-20x', weeklyLimit: 500_000 });
+    const weekly = byWindow(await claudeCodeAdapter.read(ctx), 'weekly');
+
+    expect(weekly.used).toBeCloseTo(60, 6);
+    expect(weekly.note).toContain('priced against the 500.0K-token cap');
   });
 });

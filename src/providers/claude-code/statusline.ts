@@ -104,10 +104,38 @@ export interface ObservedWindow {
 
 export type ObservedLimits = { [W in LimitWindow]?: ObservedWindow };
 
+/** A figure this window used to carry, and when it did. */
+export interface Observation {
+  usedPercentage: number;
+  observedAt: Date;
+}
+
+/**
+ * How many superseded figures one window keeps.
+ *
+ * They exist to measure a RATE - what one of this user's tokens costs against
+ * this window, in percentage points - so the useful ones are the recent ones:
+ * a week-old pair describes a week-old mix of models. Twelve is a few hundred
+ * bytes and more span than any rate should be measured over.
+ */
+export const MAX_HISTORY = 12;
+
 /** One window as the snapshot file holds it. */
 export interface SnapshotWindow extends ObservedWindow {
   /** When the kept figure last changed. Repeating it does not move this. */
   observedAt: Date;
+  /**
+   * Figures this window carried BEFORE the current one, oldest first, and only
+   * ever for the current window - a reset clears them.
+   *
+   * Two reports plus the transcripts between them say what Anthropic charged
+   * for a known quantity of local work, which is the only way this tool can
+   * know the rate rather than assume it. A configured token cap cannot: on the
+   * machine this was written for, a week of mixed models averaged 7.5 points
+   * per million tokens while the last seventeen hours of 1M-context Opus ran
+   * at 33, a 4.5x difference that no constant survives.
+   */
+  history: readonly Observation[];
 }
 
 export interface RateLimitSnapshot {
@@ -205,14 +233,31 @@ function mergeWindow(
     resetsAt: next.resetsAt,
     clamped: next.clamped,
     observedAt: now,
+    history: [],
   };
   if (kept === undefined) return fresh;
 
   const delta = next.resetsAt.getTime() - kept.resetsAt.getTime();
   if (Math.abs(delta) <= SAME_WINDOW_TOLERANCE_MS) {
-    return next.usedPercentage > kept.usedPercentage ? fresh : kept;
+    // The same window, moved on: the figure being replaced is a measurement of
+    // this window at a known instant, and the pair is what a rate is made of.
+    return next.usedPercentage > kept.usedPercentage
+      ? { ...fresh, history: withHistory(kept) }
+      : kept;
   }
+  // A different window. Its predecessor's figures describe a limit that has
+  // already reset, so they can say nothing about this one.
   return delta > 0 ? fresh : kept;
+}
+
+/** `kept`'s own figure appended to its history, newest last, capped. */
+function withHistory(kept: SnapshotWindow): readonly Observation[] {
+  const next = [
+    ...kept.history,
+    { usedPercentage: kept.usedPercentage, observedAt: kept.observedAt },
+  ];
+  // Drop from the OLD end: a rate wants recency.
+  return next.slice(Math.max(0, next.length - MAX_HISTORY));
 }
 
 /**
@@ -256,6 +301,16 @@ export function serializeSnapshot(snapshot: RateLimitSnapshot): string {
       resetsAt: entry.resetsAt.toISOString(),
       observedAt: entry.observedAt.toISOString(),
       clamped: entry.clamped,
+      // Omitted while empty: a fresh window's file stays as small and as
+      // readable as it was before history existed.
+      ...(entry.history.length > 0
+        ? {
+            history: entry.history.map((seen) => ({
+              usedPercentage: seen.usedPercentage,
+              observedAt: seen.observedAt.toISOString(),
+            })),
+          }
+        : {}),
     };
   }
 
@@ -309,10 +364,39 @@ export function parseSnapshot(text: string): RateLimitSnapshot | null {
       resetsAt,
       observedAt,
       clamped: field(entry, 'clamped') === true,
+      // A file written before history existed simply has none. Same version:
+      // the field is additive, and a reader that ignores it loses nothing but
+      // the calibration.
+      history: parseHistory(field(entry, 'history'), observedAt),
     };
   }
 
   return { writtenAt, windows };
+}
+
+/**
+ * History as the file holds it: oldest first, nothing at or after the figure it
+ * belongs to, and never more than the cap.
+ *
+ * Tolerant like the rest of the parser - one malformed entry is dropped on its
+ * own rather than taking the window with it - and it sorts rather than trusting
+ * the file's order, because several sessions write this and only the instants
+ * are authoritative.
+ */
+function parseHistory(value: unknown, observedAt: Date): readonly Observation[] {
+  if (!Array.isArray(value)) return [];
+
+  const seen: Observation[] = [];
+  for (const item of value) {
+    const used = field(item, 'usedPercentage');
+    const at = isoDate(field(item, 'observedAt'));
+    if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || used > 100) continue;
+    if (at === null || at.getTime() >= observedAt.getTime()) continue;
+    seen.push({ usedPercentage: used, observedAt: at });
+  }
+
+  seen.sort((a, b) => a.observedAt.getTime() - b.observedAt.getTime());
+  return seen.slice(Math.max(0, seen.length - MAX_HISTORY));
 }
 
 /** The snapshot on disk, or null when there is none worth trusting. Never throws. */
