@@ -45,11 +45,15 @@ use crate::theme::system_theme;
 /// an `{ok: false}` row. The widget stays on screen and says what is wrong
 /// rather than disappearing.
 #[tauri::command]
-async fn read_quota(app: AppHandle) -> Result<serde_json::Value, String> {
+async fn read_quota(app: AppHandle, refresh: Option<bool>) -> Result<serde_json::Value, String> {
     let handle = app.clone();
-    // Spawning a child and waiting up to 30 seconds for it has no business
-    // running on the main thread.
-    let payload = tauri::async_runtime::spawn_blocking(move || sidecar::read_quota(&handle))
+    // Optional, and false when absent: a caller that has not been taught about
+    // refreshing must never accidentally ask for one, and the 60-second poll is
+    // exactly that caller.
+    let refresh = refresh.unwrap_or(false);
+    // Spawning a child and waiting for it has no business running on the main
+    // thread.
+    let payload = tauri::async_runtime::spawn_blocking(move || sidecar::read_quota(&handle, refresh))
         .await
         .map_err(|error| format!("the quota reader did not finish: {error}"))?;
 

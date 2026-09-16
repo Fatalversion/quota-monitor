@@ -89,6 +89,14 @@ export interface CliOptions {
   width: number | undefined;
   /** Config file path override; undefined means "use the default location". */
   config: string | undefined;
+  /**
+   * A person asked for this read.
+   *
+   * Lets an adapter go and ask its provider for a figure rather than reading
+   * only what is on disk. Off by default, and never set by a timer: the widget
+   * passes it at startup and when the refresh control is pressed.
+   */
+  refresh: boolean;
 }
 
 export type ParsedArgs =
@@ -105,6 +113,7 @@ function emptyOptions(): CliOptions {
     color: undefined,
     width: undefined,
     config: undefined,
+    refresh: false,
   };
 }
 
@@ -158,6 +167,13 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
         options.json = true;
         break;
       }
+      case '--refresh': {
+        const bad = rejectInline();
+        if (bad !== null) return bad;
+        options.refresh = true;
+        break;
+      }
+
       case '--ascii': {
         const bad = rejectInline();
         if (bad !== null) return bad;
@@ -358,6 +374,10 @@ function helpText(): string {
     '',
     'Options:',
     '  --json            print a JSON envelope instead of the widget',
+    '  --refresh         ask each provider for a current figure using its',
+    '                    own tool, rather than reading only what is on disk.',
+    '                    For Claude Code that is "claude -p /usage", which is',
+    '                    answered inside the CLI and spends no quota',
     '  --ascii           draw bars with ASCII instead of block characters',
     '  -v, --verbose     show notes, config warnings and idle providers',
     '  --color           force colour on',
@@ -702,6 +722,7 @@ async function report(options: CliOptions, env: CliEnvironment): Promise<number>
     options: config.providers[adapter.id] ?? { enabled: true },
     secrets,
     debug,
+    refresh: options.refresh,
   }));
 
   if (options.json) {

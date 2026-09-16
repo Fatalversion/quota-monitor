@@ -107,7 +107,18 @@ describe('parseArgs', () => {
         color: undefined,
         width: undefined,
         config: undefined,
+        refresh: false,
       },
+    });
+  });
+
+  it('reads --refresh, which is how a person asks rather than a timer', () => {
+    const parsed = parseArgs(['--refresh']);
+    expect(parsed.ok && parsed.options.refresh).toBe(true);
+    // It carries no value: "--refresh=1" is a typo, not a setting.
+    expect(parseArgs(['--refresh=yes'])).toEqual({
+      ok: false,
+      error: '--refresh takes no value',
     });
   });
 

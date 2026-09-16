@@ -112,6 +112,14 @@ export interface AdapterContext {
   options: Record<string, unknown>;
   secrets: SecretStore;
   debug(message: string): void;
+  /**
+   * A person asked for this read, rather than a timer.
+   *
+   * An adapter may spend something on a refresh it would not spend on a poll -
+   * running the provider's own CLI to ask for a figure, say. Absent means the
+   * ordinary case: read what is already on disk and nothing more.
+   */
+  refresh?: boolean;
 }
 
 export interface QuotaAdapter {

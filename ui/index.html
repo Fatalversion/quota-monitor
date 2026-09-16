@@ -182,7 +182,15 @@
        */
       let loading = false;
 
-      async function load() {
+      /**
+       * Read the providers again.
+       *
+       * `refresh` asks each provider's own tool for a current figure as well -
+       * for Claude Code, `claude -p /usage`, which costs no quota but does
+       * start a process. A person asking (the button, the tray, opening the
+       * app) gets one; the 60-second poll does not.
+       */
+      async function load({ refresh = false } = {}) {
         if (loading) return;
         loading = true;
         body.dataset.loading = 'true';
@@ -190,7 +198,7 @@
           // Browser preview: prefer a locally generated fixture, fall back to
           // the committed sanitised sample so a fresh clone renders too.
           const payload = invoke
-            ? await invoke('read_quota')
+            ? await invoke('read_quota', { refresh })
             : await fetch('./fixture.json')
                 .then((r) => (r.ok ? r.json() : Promise.reject(new Error('no local fixture'))))
                 .catch(() => fetch('./fixture.sample.json').then((r) => r.json()));
@@ -459,7 +467,7 @@
         // who asked for fresh figures is reading them, and a panel that
         // collapsed out from under the pointer would be the wrong answer.
         refreshEl.addEventListener('click', () => {
-          load();
+          load({ refresh: true });
         });
 
         addEventListener(
@@ -576,7 +584,9 @@
        */
       if (tauri?.event?.listen) {
         tauri.event.listen('quota-refresh', () => {
-          load();
+          // The tray's Refresh is a person asking, exactly as the panel's
+          // control is, so it gets the same current-figures read.
+          load({ refresh: true });
         }).catch(() => {
           /* No event bus: the 60-second poll is still running. */
         });
@@ -670,8 +680,15 @@
       // is the difference between a clean start and drawing a hidden provider
       // and snatching it back. Both paths end in load() - a shell that cannot
       // answer must not cost us the data.
-      syncWithShell().then(load, load);
-      setInterval(load, 60_000);
+      // The first read of the session asks for current figures: someone who
+      // has just opened the widget is looking at it precisely because they want
+      // to know now, and on a machine that has been asleep the newest thing on
+      // disk can be hours old.
+      const first = () => load({ refresh: true });
+      syncWithShell().then(first, first);
+      // The poll reads what is on disk. It is a background tick, nobody is
+      // waiting on it, and it must not start a process every minute.
+      setInterval(() => load(), 60_000);
       // The user can switch light/dark or repaint their accent at any time.
       setInterval(applySystemTheme, 30_000);
     </script>
